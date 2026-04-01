@@ -1,0 +1,18 @@
+# ── Desktop GUI ──────────────────────────────────
+PyQt6>=6.6.0
+
+# ── System monitoring ────────────────────────────
+psutil>=5.9.0
+
+# ── AI Agent framework ───────────────────────────
+crewai>=0.30.0
+crewai-tools>=0.4.0
+
+# ── Gemini via LiteLLM (built into CrewAI) ───────
+# CrewAI uses LiteLLM under the hood.
+# Just set GEMINI_API_KEY in .env — no extra install needed.
+# If you get import errors, run: pip install litellm
+litellm>=1.0.0
+
+# ── Env / secrets ────────────────────────────────
+python-dotenv>=1.0.0
