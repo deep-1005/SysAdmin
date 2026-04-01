@@ -32,21 +32,26 @@ class ToolRunner:
     SKIP_NAMES = {"system idle process", "system", "registry", "memory compression"}
     SKIP_PIDS  = {0, 4}   # PID 0 = Idle, PID 4 = System kernel
 
-    def check_processes(self) -> str:
+    def _safe_process_info(self, attrs):
         procs = []
-        for p in psutil.process_iter(
-            ["pid", "name", "cpu_percent", "memory_percent", "status"]
-        ):
+        for p in psutil.process_iter():
             try:
-                info = p.info
-                # Skip Windows pseudo-processes — they always show fake-high CPU
-                if info["pid"] in self.SKIP_PIDS:
+                info = p.as_dict(attrs=attrs)
+                if info.get("pid") in self.SKIP_PIDS:
                     continue
                 if (info.get("name") or "").lower() in self.SKIP_NAMES:
                     continue
                 procs.append(info)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
+            except Exception:
+                continue
+        return procs
+
+    def check_processes(self) -> str:
+        procs = self._safe_process_info([
+            "pid", "name", "cpu_percent", "memory_percent", "status"
+        ])
         procs.sort(key=lambda x: x["cpu_percent"] or 0, reverse=True)
         lines = ["Top 5 processes by CPU:"]
         for p in procs[:5]:
@@ -87,20 +92,10 @@ class ToolRunner:
         return "\n".join(lines)
 
     def inspect_top_process(self) -> str:
-        procs = []
-        for p in psutil.process_iter(
-            ["pid", "name", "cpu_percent", "memory_percent",
-             "status", "num_threads", "cmdline", "exe"]
-        ):
-            try:
-                info = p.info
-                if info["pid"] in self.SKIP_PIDS:
-                    continue
-                if (info.get("name") or "").lower() in self.SKIP_NAMES:
-                    continue
-                procs.append(info)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
+        procs = self._safe_process_info([
+            "pid", "name", "cpu_percent", "memory_percent",
+            "status", "num_threads", "cmdline", "exe"
+        ])
         procs.sort(key=lambda x: x["cpu_percent"] or 0, reverse=True)
         if not procs:
             return "No processes found."
@@ -120,17 +115,7 @@ class ToolRunner:
         )
 
     def check_open_files(self) -> str:
-        procs = []
-        for p in psutil.process_iter(["pid", "name", "cpu_percent"]):
-            try:
-                info = p.info
-                if info["pid"] in self.SKIP_PIDS:
-                    continue
-                if (info.get("name") or "").lower() in self.SKIP_NAMES:
-                    continue
-                procs.append(info)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
+        procs = self._safe_process_info(["pid", "name", "cpu_percent"])
         procs.sort(key=lambda x: x["cpu_percent"] or 0, reverse=True)
         if not procs:
             return "No processes."

@@ -564,17 +564,17 @@ class WatcherWorker(QThread):
         self.sig.log_line.emit("ERR",  f"🚨 INCIDENT — {ev}")
         self.sig.log_line.emit("WARN", f"CPU={ctx['cpu_usage']}%  RAM={ctx['memory_usage']}%")
         self.sig.agent_state.emit("detective")
-        self.sig.thought.emit("▸", f"Trigger [{ev}] — handing off to Gemini AI agent...")
+        self.sig.thought.emit("▸", f"Trigger [{ev}] — handing off to local Ollama AI agent...")
         self.sig.thought.emit("▸", "Detective agent starting diagnostic chain...")
 
         try:
             # ── REAL AI CALL ──────────────────────────────────
-            # This is where Gemini actually decides which tools to call.
+            # This is where the local Ollama model decides which tools to call.
             # It reads check_processes output and CHOOSES what to do next.
             from detective_agent import run_diagnostic_crew
 
-            self.sig.thought.emit("🔍", "Gemini is analyzing your system — this may take 15–30 seconds...")
-            self.sig.log_line.emit("INFO", "Gemini AI agent running — analyzing live system data...")
+            self.sig.thought.emit("🔍", "Local AI is analyzing your system — this may take 15–30 seconds...")
+            self.sig.log_line.emit("INFO", "Ollama AI agent running — analyzing live system data...")
 
             result = run_diagnostic_crew(ctx)   # blocks, runs on this thread
 
@@ -596,11 +596,11 @@ class WatcherWorker(QThread):
             self.sig.log_line.emit("INFO", "Use the action buttons below to respond.")
 
         except RuntimeError as e:
-            # Missing API key — show friendly message
+            # Runtime setup/model issue — show friendly message
             self.sig.agent_state.emit("idle")
             self.sig.thought.emit("❌", str(e))
-            self.sig.log_line.emit("ERR", "GEMINI_API_KEY not found in .env file.")
-            self.sig.log_line.emit("INFO", "Get a free key at: aistudio.google.com/apikey")
+            self.sig.log_line.emit("ERR", "Ollama runtime is not ready or model load failed.")
+            self.sig.log_line.emit("INFO", "Check: ollama serve  and  ollama list")
             self._incident = False
 
         except Exception as e:
@@ -708,8 +708,8 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         main = QVBoxLayout(root)
-        main.setContentsMargins(16, 12, 16, 12)
-        main.setSpacing(8)
+        main.setContentsMargins(22, 16, 22, 16)
+        main.setSpacing(12)
 
         # ── header bar ────────────────────────────────────────
         hdr = QHBoxLayout()
@@ -767,7 +767,7 @@ class MainWindow(QMainWindow):
         self.health_lbl.setStyleSheet(f"color: {MUTED2}; background: transparent;")
         hl.addWidget(self.health_lbl)
         hl.addStretch()
-        self.ai_status_lbl = QLabel("🤖 AI: Ready  (Gemini)")
+        self.ai_status_lbl = QLabel("🤖 AI: Ready  (Ollama)")
         self.ai_status_lbl.setFont(QFont("Segoe UI", 8))
         self.ai_status_lbl.setStyleSheet(f"color: {MUTED}; background: transparent;")
         hl.addWidget(self.ai_status_lbl)
@@ -775,7 +775,7 @@ class MainWindow(QMainWindow):
 
         # ── metric cards row ──────────────────────────────────
         cards_row = QHBoxLayout()
-        cards_row.setSpacing(10)
+        cards_row.setSpacing(14)
         self.card_cpu  = MetricCard("CPU Usage",    GREEN)
         self.card_ram  = MetricCard("Memory (RAM)", CYAN)
         self.card_disk = MetricCard("Disk Space C:", PURPLE)
@@ -788,14 +788,54 @@ class MainWindow(QMainWindow):
 
         for c in [self.card_cpu, self.card_ram, self.card_disk, self.card_proc]:
             c.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-            c.setMinimumHeight(260)
-            c.setMaximumHeight(280)
+            c.setMinimumHeight(272)
+            c.setMaximumHeight(296)
             cards_row.addWidget(c)
         main.addLayout(cards_row)
 
-        # ── middle row: thought chain + process table ─────────
+        # ── incident spotlight ───────────────────────────────
+        self.incident_card = QFrame()
+        self.incident_card.setObjectName("IncidentCard")
+        self.incident_card.setStyleSheet(f"""
+            #IncidentCard {{
+                background: #0d1829;
+                border: 1px solid {BORDER_LIT};
+                border-radius: 12px;
+            }}
+        """)
+        icl = QVBoxLayout(self.incident_card)
+        icl.setContentsMargins(18, 14, 18, 14)
+        icl.setSpacing(6)
+
+        ic_head = QHBoxLayout()
+        self.incident_badge = QLabel("🟢 Normal")
+        self.incident_badge.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self.incident_badge.setStyleSheet(f"color: {GREEN}; background: transparent;")
+        self.incident_time = QLabel("last update: --:--:--")
+        self.incident_time.setFont(QFont("Consolas", 8))
+        self.incident_time.setStyleSheet(f"color: {MUTED}; background: transparent;")
+        ic_head.addWidget(self.incident_badge)
+        ic_head.addStretch()
+        ic_head.addWidget(self.incident_time)
+        icl.addLayout(ic_head)
+
+        self.incident_title = QLabel("No active incident. System is being monitored.")
+        self.incident_title.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self.incident_title.setStyleSheet(f"color: {TEXT}; background: transparent;")
+        self.incident_title.setWordWrap(True)
+        icl.addWidget(self.incident_title)
+
+        self.incident_detail = QLabel("If something abnormal happens, this area will explain what was detected and what action to take.")
+        self.incident_detail.setFont(QFont("Segoe UI", 9))
+        self.incident_detail.setStyleSheet(f"color: {MUTED2}; background: transparent;")
+        self.incident_detail.setWordWrap(True)
+        icl.addWidget(self.incident_detail)
+
+        main.addWidget(self.incident_card)
+
+        # ── middle row: investigation feed + process/actions ──
         mid = QHBoxLayout()
-        mid.setSpacing(10)
+        mid.setSpacing(14)
 
         # thought panel
         thought_frame = QFrame()
@@ -804,8 +844,8 @@ class MainWindow(QMainWindow):
             #TF {{ background: {BG_CARD2}; border: 1px solid {BORDER}; border-radius: 12px; }}
         """)
         tfl = QVBoxLayout(thought_frame)
-        tfl.setContentsMargins(14, 12, 14, 12)
-        tfl.setSpacing(6)
+        tfl.setContentsMargins(16, 14, 16, 14)
+        tfl.setSpacing(8)
 
         th_hdr = QHBoxLayout()
         th_title = QLabel("🤖  AI Agent Live Thinking")
@@ -821,36 +861,20 @@ class MainWindow(QMainWindow):
         tfl.addLayout(th_hdr)
 
         self.thoughts = ThoughtWidget()
-        self.thoughts.setMinimumHeight(180)
+        self.thoughts.setMinimumHeight(220)
         tfl.addWidget(self.thoughts)
 
         mid.addWidget(thought_frame, stretch=3)
-        mid.addWidget(self._vdivider())
+
+        right_col = QVBoxLayout()
+        right_col.setSpacing(12)
 
         # process table
         self.proctable = ProcessTable()
-        self.proctable.setFixedWidth(440)
-        mid.addWidget(self.proctable)
+        self.proctable.setMinimumWidth(460)
+        right_col.addWidget(self.proctable)
 
-        main.addLayout(mid)
-
-        # ── RCA card ──────────────────────────────────────────
-        self.rca = RCACard(
-            on_kill  = self._kill_pid,
-            on_slack = self._send_slack,
-            on_reset = self._reset,
-        )
-        main.addWidget(self.rca)
-
-        # ── bottom: log + friendly control panel ──────────────
-        bot = QHBoxLayout()
-        bot.setSpacing(10)
-
-        self.log = LogWidget()
-        self.log.setMinimumHeight(150)
-        bot.addWidget(self.log, stretch=1)
-
-        # ── FRIENDLY CONTROL PANEL ────────────────────────────
+        # ── friendly control panel ───────────────────────────
         ctrl = QFrame()
         ctrl.setObjectName("CtrlPanel")
         ctrl.setStyleSheet(f"""
@@ -860,10 +884,9 @@ class MainWindow(QMainWindow):
                 border-radius: 14px;
             }}
         """)
-        ctrl.setFixedWidth(320)
         cl = QVBoxLayout(ctrl)
-        cl.setContentsMargins(16, 14, 16, 14)
-        cl.setSpacing(10)
+        cl.setContentsMargins(18, 16, 18, 16)
+        cl.setSpacing(12)
 
         # section title
         ctrl_title = QLabel("🎮  Actions")
@@ -928,8 +951,24 @@ class MainWindow(QMainWindow):
         pbl.addStretch()
         cl.addWidget(self.pid_badge)
 
-        bot.addWidget(ctrl)
-        main.addLayout(bot)
+        right_col.addWidget(ctrl)
+        right_col.addStretch()
+
+        mid.addLayout(right_col, stretch=2)
+        main.addLayout(mid)
+
+        # ── RCA card ──────────────────────────────────────────
+        self.rca = RCACard(
+            on_kill=self._kill_pid,
+            on_slack=self._send_slack,
+            on_reset=self._reset,
+        )
+        main.addWidget(self.rca)
+
+        # ── activity log (full width) ─────────────────────────
+        self.log = LogWidget()
+        self.log.setMinimumHeight(170)
+        main.addWidget(self.log)
 
         # ── AI explanation banner (always visible at bottom) ───
         ai_banner = QFrame()
@@ -942,7 +981,7 @@ class MainWindow(QMainWindow):
             }}
         """)
         abl = QHBoxLayout(ai_banner)
-        abl.setContentsMargins(14, 8, 14, 8)
+        abl.setContentsMargins(16, 10, 16, 10)
         abl.setSpacing(12)
 
         brain_icon = QLabel("🧠")
@@ -952,11 +991,11 @@ class MainWindow(QMainWindow):
 
         ai_text = QLabel(
             "<b style='color:#00c3ff'>How the AI works:</b>  "
-            "When a problem is detected, a <b>Gemini AI agent</b> automatically runs checks on your system "
+            "When a problem is detected, a <b>local Ollama AI agent</b> automatically runs checks on your system "
             "(like checking which app is using the most CPU or RAM) and decides <i>on its own</i> what to "
             "investigate next — just like a human IT expert would. "
             "It then writes a plain-English report explaining what went wrong and what to do. "
-            "<span style='color:#64748b'>  →  Powered by Google Gemini (free). Key set in your .env file.</span>"
+            "<span style='color:#64748b'>  →  Powered by local Ollama models. Set OLLAMA_MODEL in your .env file.</span>"
         )
         ai_text.setFont(QFont("Segoe UI", 8))
         ai_text.setStyleSheet(f"color: {MUTED2}; background: transparent;")
@@ -971,6 +1010,13 @@ class MainWindow(QMainWindow):
         l.setFont(QFont("Segoe UI", 8))
         l.setStyleSheet(f"color: {MUTED};")
         return l
+
+    def _set_incident_spotlight(self, badge: str, badge_color: str, title: str, detail: str):
+        self.incident_badge.setText(badge)
+        self.incident_badge.setStyleSheet(f"color: {badge_color}; background: transparent;")
+        self.incident_title.setText(title)
+        self.incident_detail.setText(detail)
+        self.incident_time.setText(f"last update: {datetime.now().strftime('%H:%M:%S')}")
 
     def _vdivider(self) -> QFrame:
         f = QFrame()
@@ -1003,13 +1049,13 @@ class MainWindow(QMainWindow):
         """A two-line button card: bold title + muted description. Uses QPushButton so it renders."""
         btn = QPushButton()
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setMinimumHeight(56)
+        btn.setMinimumHeight(64)
         btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         btn.setStyleSheet(f"""
             QPushButton {{
                 background: {BG_CARD2};
                 border: 1px solid {color}50;
-                border-radius: 8px;
+                border-radius: 10px;
                 text-align: left;
                 padding: 0px 12px;
             }}
@@ -1024,8 +1070,8 @@ class MainWindow(QMainWindow):
         inner = QWidget(btn)
         inner.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         il = QVBoxLayout(inner)
-        il.setContentsMargins(12, 8, 12, 8)
-        il.setSpacing(2)
+        il.setContentsMargins(14, 10, 14, 10)
+        il.setSpacing(3)
 
         t = QLabel(title)
         t.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
@@ -1047,7 +1093,7 @@ class MainWindow(QMainWindow):
             w.setGeometry(0, 0, b.width(), b.height())
             QPushButton.resizeEvent(b, event)
         btn.resizeEvent = _resize
-        inner.setGeometry(0, 0, 320, 56)
+        inner.setGeometry(0, 0, 340, 64)
 
         return btn
 
@@ -1135,6 +1181,12 @@ class MainWindow(QMainWindow):
             self.status_dot.setStyleSheet(f"color: {col};")
             self.status_lbl.setStyleSheet(f"color: {col};")
             self.status_lbl.setText(msg)
+            self._set_incident_spotlight(
+                "🔴 Active Incident",
+                RED,
+                f"{msg}",
+                "The AI agent is collecting evidence and will generate a clear root-cause report."
+            )
         else:
             col = YELLOW if m["cpu_usage"] > 60 or m["memory_usage"] > 70 else GREEN
             self.tray.setIcon(_make_tray_icon("yellow" if col == YELLOW else "green"))
@@ -1142,6 +1194,12 @@ class MainWindow(QMainWindow):
             self.status_dot.setStyleSheet(f"color: {col};")
             self.status_lbl.setStyleSheet(f"color: {col};")
             self.status_lbl.setText("Everything looks good")
+            self._set_incident_spotlight(
+                "🟢 Normal",
+                GREEN,
+                "No active incident. System is being monitored.",
+                "Live checks are running for CPU, memory, disk, process count, and logs."
+            )
 
         # clock
         self.clock_lbl.setText(datetime.now().strftime("%H:%M:%S"))
@@ -1155,6 +1213,12 @@ class MainWindow(QMainWindow):
         self._pid_icon.setText("⚠️")
         self._pid_text.setText(f"Culprit: PID {pid} — action needed")
         self._pid_text.setStyleSheet(f"color: {YELLOW}; background: transparent;")
+        self._set_incident_spotlight(
+            "🟠 Action Needed",
+            YELLOW,
+            f"Issue isolated to PID {pid}.",
+            "Review the report below, then choose Stop the Problem, Notify via Slack, or Dismiss & Reset."
+        )
         self.rca.show_rca(rca, pid)
         self.tray.showMessage(
             "⚠ Incident Detected",
@@ -1186,13 +1250,35 @@ class MainWindow(QMainWindow):
         self.health_lbl.setText(msg)
         self.health_lbl.setStyleSheet(f"color: {col}; background: transparent;")
         ai_states = {
-            "idle":      "🤖 AI: Ready  (Gemini)",
+            "idle":      "🤖 AI: Ready  (Ollama)",
             "triggered": "🤖 AI: Waking up...",
             "detective": "🤖 AI: Investigating ⏳",
             "reporter":  "🤖 AI: Writing report ⏳",
             "done":      "🤖 AI: Done ✓",
         }
         self.ai_status_lbl.setText(ai_states.get(state, "🤖 AI: Ready"))
+
+        if state == "detective":
+            self._set_incident_spotlight(
+                "🔍 Investigating",
+                CYAN,
+                "AI is diagnosing the issue right now.",
+                "Please wait while the agent checks process, memory, disk, and network evidence."
+            )
+        elif state == "reporter":
+            self._set_incident_spotlight(
+                "📝 Writing Report",
+                PURPLE,
+                "Investigation finished. Building your RCA summary.",
+                "The final report will explain what happened and what to do next in simple language."
+            )
+        elif state == "done" and not self._cur_pid:
+            self._set_incident_spotlight(
+                "✅ Investigation Complete",
+                GREEN,
+                "Analysis completed with no specific culprit PID.",
+                "Check the RCA section for details and recommended next steps."
+            )
 
     # ── UPTIME ────────────────────────────────────────────────
     def _tick_uptime(self):
@@ -1360,6 +1446,12 @@ class MainWindow(QMainWindow):
         self._pid_icon.setText("💤")
         self._pid_text.setText("No active incident")
         self._pid_text.setStyleSheet(f"color: {MUTED2}; background: transparent;")
+        self._set_incident_spotlight(
+            "🟢 Normal",
+            GREEN,
+            "Incident dismissed. Monitoring resumed.",
+            "The AI agent is back to background watch mode."
+        )
         self.thoughts.clear_thoughts()
         self._on_agent_state("idle")
         self.rca.hide_rca()
