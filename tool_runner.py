@@ -5,6 +5,7 @@ All tools are READ-ONLY. No shell=True. No admin needed.
 Uses psutil instead of Unix commands so it works on Windows.
 """
 import psutil
+import time
 
 
 class ToolRunner:
@@ -48,10 +49,34 @@ class ToolRunner:
                 continue
         return procs
 
+    def _safe_process_info_with_cpu(self):
+        # psutil returns 0.0 on first call; prime once, wait briefly, then sample.
+        for p in psutil.process_iter():
+            try:
+                p.cpu_percent(interval=None)
+            except Exception:
+                continue
+
+        time.sleep(0.25)
+
+        procs = []
+        for p in psutil.process_iter():
+            try:
+                info = p.as_dict(attrs=["pid", "name", "memory_percent", "status"])
+                if info.get("pid") in self.SKIP_PIDS:
+                    continue
+                if (info.get("name") or "").lower() in self.SKIP_NAMES:
+                    continue
+                info["cpu_percent"] = p.cpu_percent(interval=None)
+                procs.append(info)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            except Exception:
+                continue
+        return procs
+
     def check_processes(self) -> str:
-        procs = self._safe_process_info([
-            "pid", "name", "cpu_percent", "memory_percent", "status"
-        ])
+        procs = self._safe_process_info_with_cpu()
         procs.sort(key=lambda x: x["cpu_percent"] or 0, reverse=True)
         lines = ["Top 5 processes by CPU:"]
         for p in procs[:5]:
@@ -92,16 +117,20 @@ class ToolRunner:
         return "\n".join(lines)
 
     def inspect_top_process(self) -> str:
-        procs = self._safe_process_info([
-            "pid", "name", "cpu_percent", "memory_percent",
-            "status", "num_threads", "cmdline", "exe"
-        ])
+        procs = self._safe_process_info_with_cpu()
         procs.sort(key=lambda x: x["cpu_percent"] or 0, reverse=True)
         if not procs:
             return "No processes found."
         t = procs[0]
-        cmd = " ".join(t.get("cmdline") or []) or "(unavailable)"
-        exe = t.get("exe") or "(unavailable)"
+
+        try:
+            proc = psutil.Process(t["pid"])
+            details = proc.as_dict(attrs=["num_threads", "cmdline", "exe"])
+        except Exception:
+            details = {"num_threads": "N/A", "cmdline": [], "exe": "(unavailable)"}
+
+        cmd = " ".join(details.get("cmdline") or []) or "(unavailable)"
+        exe = details.get("exe") or "(unavailable)"
         return (
             f"Top Process Inspection:\n"
             f"  PID     : {t['pid']}\n"
@@ -111,11 +140,11 @@ class ToolRunner:
             f"  CPU     : {t['cpu_percent']}%\n"
             f"  Memory  : {round(t['memory_percent'], 2)}%\n"
             f"  Status  : {t['status']}\n"
-            f"  Threads : {t.get('num_threads', 'N/A')}"
+            f"  Threads : {details.get('num_threads', 'N/A')}"
         )
 
     def check_open_files(self) -> str:
-        procs = self._safe_process_info(["pid", "name", "cpu_percent"])
+        procs = self._safe_process_info_with_cpu()
         procs.sort(key=lambda x: x["cpu_percent"] or 0, reverse=True)
         if not procs:
             return "No processes."

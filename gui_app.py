@@ -10,6 +10,7 @@ Build: pyinstaller --onefile --windowed --icon=icon.ico gui_app.py
 """
 
 import sys, os, time, threading
+import traceback
 from datetime import datetime
 from collections import deque
 
@@ -25,8 +26,22 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QPen, QBrush, QFont, QFontDatabase,
-    QIcon, QPixmap, QPainterPath, QLinearGradient, QAction
+    QIcon, QPixmap, QPainterPath, QLinearGradient, QRadialGradient, QAction
 )
+
+_RUNTIME_LOG_PATH = os.path.join(os.path.dirname(__file__), "logs", "runtime.log")
+_RUNTIME_LOG_LOCK = threading.Lock()
+
+
+def _write_runtime_log(level: str, message: str):
+    try:
+        os.makedirs(os.path.dirname(_RUNTIME_LOG_PATH), exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with _RUNTIME_LOG_LOCK:
+            with open(_RUNTIME_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] [{level}] {message}\n")
+    except Exception:
+        pass
 
 # ── project modules ───────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
@@ -50,6 +65,9 @@ RED        = "#ef4444"
 TEXT       = "#e2e8f0"
 MUTED      = "#64748b"
 MUTED2     = "#94a3b8"
+BG_AURA_1  = "#0a1522"
+BG_AURA_2  = "#10182a"
+GLOW_SOFT  = "#26d7ff"
 
 def color_for(val: float) -> str:
     if val >= 85: return RED
@@ -58,18 +76,30 @@ def color_for(val: float) -> str:
 
 GLOBAL_STYLE = f"""
 QMainWindow, QWidget {{
-    background: {BG_DEEP};
+    background: transparent;
     color: {TEXT};
-    font-family: 'Segoe UI', 'Consolas', monospace;
+    font-family: 'Segoe UI Variable', 'Segoe UI', 'Consolas', monospace;
 }}
 QScrollBar:vertical {{
     background: {BG_CARD};
-    width: 6px; border-radius: 3px;
+    width: 10px; border-radius: 5px;
+    margin: 4px;
 }}
 QScrollBar::handle:vertical {{
-    background: {BORDER_LIT}; border-radius: 3px;
+    background: {BORDER_LIT}; border-radius: 5px;
+    min-height: 24px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background: {CYAN};
 }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QToolTip {{
+    background: {BG_CARD2};
+    color: {TEXT};
+    border: 1px solid {BORDER_LIT};
+    padding: 6px 8px;
+    border-radius: 6px;
+}}
 QMenu {{
     background: {BG_CARD2};
     color: {TEXT};
@@ -85,13 +115,47 @@ QMenu::item:selected {{ background: {BORDER_LIT}; }}
 #  CUSTOM WIDGETS
 # ══════════════════════════════════════════════════════════════
 
+class GradientPanel(QWidget):
+    """Atmospheric background with layered gradients for a premium dashboard look."""
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.rect()
+
+        base = QLinearGradient(0, 0, r.width(), r.height())
+        base.setColorAt(0.0, QColor(BG_DEEP))
+        base.setColorAt(0.5, QColor(BG_AURA_1))
+        base.setColorAt(1.0, QColor(BG_AURA_2))
+        p.fillRect(r, QBrush(base))
+
+        # Soft light blooms to avoid a flat background.
+        glow_a = QRadialGradient(r.width() * 0.12, r.height() * 0.06, r.width() * 0.45)
+        c1 = QColor(GLOW_SOFT)
+        c1.setAlpha(58)
+        c2 = QColor(GLOW_SOFT)
+        c2.setAlpha(0)
+        glow_a.setColorAt(0.0, c1)
+        glow_a.setColorAt(1.0, c2)
+        p.fillRect(r, QBrush(glow_a))
+
+        glow_b = QRadialGradient(r.width() * 0.88, r.height() * 0.88, r.width() * 0.40)
+        c3 = QColor(PURPLE)
+        c3.setAlpha(42)
+        c4 = QColor(PURPLE)
+        c4.setAlpha(0)
+        glow_b.setColorAt(0.0, c3)
+        glow_b.setColorAt(1.0, c4)
+        p.fillRect(r, QBrush(glow_b))
+
+        p.end()
+
 class SparklineWidget(QWidget):
     """Mini live line graph drawn with QPainter."""
     def __init__(self, color=GREEN, parent=None):
         super().__init__(parent)
         self._color  = QColor(color)
         self._data: deque = deque(maxlen=60)
-        self.setMinimumHeight(40)
+        self.setMinimumHeight(44)
         self.setMinimumWidth(80)
 
     def push(self, val: float):
@@ -105,10 +169,22 @@ class SparklineWidget(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
         pts  = list(self._data)
-        mx   = max(pts) or 1
+        # Keep sparkline scale stable across updates so motion feels smooth.
+        mx   = 100.0
         n    = len(pts)
-        xs   = [int(i / (n - 1) * w) for i in range(n)]
-        ys   = [int(h - (v / mx) * (h - 6)) for v in pts]
+        left_pad, right_pad = 2, 2
+        top_pad, bottom_pad = 4, 6
+        draw_w = max(1, w - left_pad - right_pad)
+        draw_h = max(1, h - top_pad - bottom_pad)
+        xs   = [int(left_pad + i / (n - 1) * draw_w) for i in range(n)]
+        ys   = [int(top_pad + (1.0 - min(max(v, 0), mx) / mx) * draw_h) for v in pts]
+
+        # Baseline track below the sparkline.
+        base_col = QColor(self._color)
+        base_col.setAlpha(85)
+        base_pen = QPen(base_col, 1)
+        p.setPen(base_pen)
+        p.drawLine(left_pad, h - 2, w - right_pad, h - 2)
 
         # gradient fill under line
         path = QPainterPath()
@@ -117,20 +193,37 @@ class SparklineWidget(QWidget):
             path.lineTo(x, y)
         path.lineTo(xs[-1], h)
         path.closeSubpath()
-        grad = QLinearGradient(0, 0, 0, h)
+        grad = QLinearGradient(0, top_pad, 0, h)
         c = QColor(self._color)
-        c.setAlpha(60)
+        c.setAlpha(88)
         grad.setColorAt(0, c)
         c2 = QColor(self._color)
         c2.setAlpha(0)
         grad.setColorAt(1, c2)
         p.fillPath(path, QBrush(grad))
 
-        # line
-        pen = QPen(self._color, 1.5)
+        # Soft glow pass behind the main line.
+        glow_col = QColor(self._color)
+        glow_col.setAlpha(90)
+        glow_pen = QPen(glow_col, 4.2)
+        glow_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(glow_pen)
+        for i in range(1, n):
+            p.drawLine(xs[i-1], ys[i-1], xs[i], ys[i])
+
+        # Crisp foreground line.
+        pen = QPen(self._color, 1.8)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         p.setPen(pen)
         for i in range(1, n):
             p.drawLine(xs[i-1], ys[i-1], xs[i], ys[i])
+
+        # Pulse dot on latest point.
+        dot_col = QColor(self._color)
+        dot_col.setAlpha(220)
+        p.setBrush(QBrush(dot_col))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(xs[-1] - 2, ys[-1] - 2, 5, 5)
         p.end()
 
 
@@ -210,7 +303,15 @@ class MetricCard(QFrame):
 
         # sparkline
         self.spark = SparklineWidget(accent)
-        self.spark.setFixedHeight(32)
+        self.spark.setFixedHeight(46)
+        self.spark.setObjectName("SparkBand")
+        self.spark.setStyleSheet(f"""
+            #SparkBand {{
+                background: {BG_CARD2};
+                border: 1px solid {accent}55;
+                border-radius: 8px;
+            }}
+        """)
         lay.addWidget(self.spark)
 
         # subtitle
@@ -288,6 +389,8 @@ class LogWidget(QScrollArea):
         QTimer.singleShot(50, lambda: self.verticalScrollBar().setValue(
             self.verticalScrollBar().maximum()
         ))
+
+        _write_runtime_log(level, msg)
 
 
 class ThoughtWidget(QScrollArea):
@@ -498,9 +601,12 @@ class ProcessTable(QFrame):
             lay = r.layout()
             if i < len(procs):
                 p = procs[i]
-                c = color_for(p["cpu_percent"])
+                cpu_raw = float(p.get("cpu_percent") or 0.0)
+                # Show raw per-process CPU from psutil; dividing by core count hides real usage.
+                cpu_disp = max(0.0, cpu_raw)
+                c = color_for(min(100.0, cpu_disp))
                 items = [str(p["pid"]), p["name"][:22],
-                         f"{p['cpu_percent']:.1f}", f"{p['memory_percent']:.1f}"]
+                         f"{cpu_disp:.1f}", f"{p['memory_percent']:.1f}"]
                 colors = [TEXT, CYAN, c, TEXT]
                 for j in range(lay.count()):
                     w = lay.itemAt(j).widget()
@@ -537,11 +643,42 @@ class WatcherWorker(QThread):
         self._last_trig: dict = {}
         self._incident   = False
         self._cur_pid    = None
+        self._proc_cpu_primed = False
         self.COOLDOWN    = 90
+        self.DIAGNOSTIC_TIMEOUT_S = max(45, int(os.getenv("DIAGNOSTIC_TIMEOUT_S", "120")))
+
+    def _extract_pid_from_text(self, text: str) -> str:
+        import re
+        for m in re.finditer(r"PID[=:\\s]+(\\d+)", text, re.IGNORECASE):
+            p = m.group(1)
+            if p not in ("0", "4"):
+                return p
+        return "N/A"
+
+    def _fallback_pid(self) -> str:
+        """Best-effort PID when model output misses it: use live top CPU process."""
+        try:
+            out = self.runner.check_processes()
+            pid = self._extract_pid_from_text(out)
+            if pid != "N/A":
+                return pid
+        except Exception:
+            pass
+        return "N/A"
 
     def stop(self): self._running = False
 
     def run(self):
+        # Prime process CPU counters once so the first visible sample is meaningful.
+        if not self._proc_cpu_primed:
+            for p in psutil.process_iter():
+                try:
+                    p.cpu_percent(interval=None)
+                except Exception:
+                    pass
+            time.sleep(0.25)
+            self._proc_cpu_primed = True
+
         while self._running:
             try:
                 m = self.watcher.get_metrics()
@@ -556,6 +693,7 @@ class WatcherWorker(QThread):
                         ctx = self.ctx_builder.build_context(m, ev, evs)
                         self._run_agent(ctx)
             except Exception as e:
+                _write_runtime_log("ERR", f"Worker error: {e}\n{traceback.format_exc()}")
                 self.sig.log_line.emit("ERR", f"Worker error: {e}")
             time.sleep(2)
 
@@ -576,11 +714,18 @@ class WatcherWorker(QThread):
             self.sig.thought.emit("🔍", "Local AI is analyzing your system — this may take 15–30 seconds...")
             self.sig.log_line.emit("INFO", "Ollama AI agent running — analyzing live system data...")
 
-            result = run_diagnostic_crew(ctx)   # blocks, runs on this thread
+            result = self._run_diagnostic_crew_with_timeout(
+                run_diagnostic_crew,
+                ctx,
+                timeout_s=self.DIAGNOSTIC_TIMEOUT_S,
+            )
 
             rca = result["rca"]
-            pid = result.get("pid", "unknown")
+            pid = result.get("pid", "N/A")
             diag = result.get("diagnostic_result", "")
+            if not str(pid).isdigit():
+                pid = self._fallback_pid()
+                self.sig.log_line.emit("WARN", f"Model returned no usable PID; using live fallback PID {pid}.")
 
             # Stream key findings from the diagnostic into the thought panel
             self.sig.thought.emit("✓", "Detective agent finished investigation.")
@@ -594,6 +739,7 @@ class WatcherWorker(QThread):
             self.sig.rca_ready.emit(rca, pid)
             self.sig.log_line.emit("OK",   f"✅ AI diagnosis complete — PID {pid} identified")
             self.sig.log_line.emit("INFO", "Use the action buttons below to respond.")
+            self._incident = False
 
         except RuntimeError as e:
             # Runtime setup/model issue — show friendly message
@@ -601,6 +747,20 @@ class WatcherWorker(QThread):
             self.sig.thought.emit("❌", str(e))
             self.sig.log_line.emit("ERR", "Ollama runtime is not ready or model load failed.")
             self.sig.log_line.emit("INFO", "Check: ollama serve  and  ollama list")
+            _write_runtime_log("ERR", f"RuntimeError in _run_agent: {e}\n{traceback.format_exc()}")
+            self._incident = False
+
+        except TimeoutError:
+            # If Ollama stalls, fail fast and keep the dashboard responsive.
+            self.sig.agent_state.emit("reporter")
+            self.sig.thought.emit("⚠", "Ollama took too long. Falling back to the local rule-based report.")
+            self.sig.log_line.emit("WARN", "Ollama timed out — using fallback RCA so the dashboard stays responsive.")
+            rca = self._build_rca(ctx)
+            pid = self._cur_pid or self._fallback_pid()
+            self._cur_pid = pid
+            self.sig.rca_ready.emit(rca, pid)
+            self.sig.agent_state.emit("done")
+            _write_runtime_log("WARN", "Ollama timeout in _run_agent; fallback RCA used.")
             self._incident = False
 
         except Exception as e:
@@ -609,17 +769,43 @@ class WatcherWorker(QThread):
             self.sig.thought.emit("❌", f"Agent error: {e}")
             self.sig.log_line.emit("ERR", f"Agent failed: {e}")
             self.sig.log_line.emit("INFO", "Falling back to rule-based diagnosis...")
+            _write_runtime_log("ERR", f"Unhandled exception in _run_agent: {e}\n{traceback.format_exc()}")
             # Fall back to simple rule-based RCA
             rca = self._build_rca(ctx)
-            pid = self._cur_pid or "?"
+            pid = self._cur_pid or self._fallback_pid()
+            self._cur_pid = pid
             self.sig.rca_ready.emit(rca, pid)
             self.sig.agent_state.emit("done")
+            self._incident = False
+
+    def _run_diagnostic_crew_with_timeout(self, func, ctx: dict, timeout_s: int = 60) -> dict:
+        """Run the Ollama diagnostic in a helper thread and fail fast if it stalls."""
+        result_box: dict = {}
+        error_box: dict = {}
+
+        def _target():
+            try:
+                result_box["value"] = func(ctx)
+            except Exception as exc:
+                error_box["error"] = exc
+
+        t = threading.Thread(target=_target, daemon=True)
+        t.start()
+        t.join(timeout_s)
+
+        if t.is_alive():
+            raise TimeoutError(f"Diagnostic timed out after {timeout_s}s")
+
+        if error_box.get("error") is not None:
+            raise error_box["error"]
+
+        return result_box.get("value", {})
 
     def _build_rca(self, ctx: dict) -> str:
         ev  = ctx["primary_event"]
         cpu = ctx["cpu_usage"]
         ram = ctx["memory_usage"]
-        pid = self._cur_pid or "unknown"
+        pid = self._cur_pid or "N/A"
         sym = {
             "CPU_SPIKE":          f"CPU spike ({cpu}%) exceeded the safe threshold.",
             "MEMORY_SPIKE":       f"Memory exhaustion ({ram}%) — system approaching OOM.",
@@ -705,8 +891,17 @@ class MainWindow(QMainWindow):
 
     # ── UI BUILD ──────────────────────────────────────────────
     def _build_ui(self):
-        root = QWidget()
-        self.setCentralWidget(root)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setCentralWidget(scroll)
+
+        root = GradientPanel()
+        root.setMinimumWidth(1220)
+        scroll.setWidget(root)
+
         main = QVBoxLayout(root)
         main.setContentsMargins(22, 16, 22, 16)
         main.setSpacing(12)
@@ -778,7 +973,8 @@ class MainWindow(QMainWindow):
         cards_row.setSpacing(14)
         self.card_cpu  = MetricCard("CPU Usage",    GREEN)
         self.card_ram  = MetricCard("Memory (RAM)", CYAN)
-        self.card_disk = MetricCard("Disk Space C:", PURPLE)
+        disk_label = f"Disk Space {self._disk_label()}"
+        self.card_disk = MetricCard(disk_label, PURPLE)
         self.card_proc = MetricCard("Running Apps",  YELLOW)
 
         self.card_cpu.setToolTip("How hard your processor is working.\nAbove 80% = high load.")
@@ -901,8 +1097,8 @@ class MainWindow(QMainWindow):
 
         # big friendly buttons with descriptions
         self.demo_btn = self._friendly_btn(
-            "▶  Run a Test",
-            "Simulate a problem so you can see\nthe AI working in real time",
+            "▶  Run Live AI Check",
+            "Analyze your current system state\nusing live realtime metrics",
             GREEN, self._simulate
         )
         cl.addWidget(self.demo_btn)
@@ -1005,11 +1201,113 @@ class MainWindow(QMainWindow):
         abl.addWidget(ai_text)
         main.addWidget(ai_banner)
 
+        # Add depth and polish to main cards/panels.
+        self._apply_shadow(self.health_strip, CYAN)
+        self._apply_shadow(self.incident_card, CYAN)
+        self._apply_shadow(thought_frame, CYAN)
+        self._apply_shadow(self.proctable, PURPLE)
+        self._apply_shadow(ctrl, GREEN)
+        self._apply_shadow(self.rca, RED)
+        self._apply_shadow(self.log, CYAN)
+        self._apply_shadow(ai_banner, CYAN)
+        self._apply_shadow(self.pid_badge, YELLOW)
+        for c in [self.card_cpu, self.card_ram, self.card_disk, self.card_proc]:
+            self._apply_shadow(c, CYAN)
+
+    def _apply_shadow(self, widget: QWidget, color: str):
+        fx = QGraphicsDropShadowEffect(self)
+        glow = QColor(color)
+        glow.setAlpha(70)
+        fx.setBlurRadius(22)
+        fx.setOffset(0, 8)
+        fx.setColor(glow)
+        widget.setGraphicsEffect(fx)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if getattr(self, "_intro_done", False):
+            return
+        self._intro_done = True
+
+        # One-time cinematic fade-in on first launch.
+        self.setWindowOpacity(0.0)
+        self._fade_anim = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade_anim.setDuration(700)
+        self._fade_anim.setStartValue(0.0)
+        self._fade_anim.setEndValue(1.0)
+        self._fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade_anim.start()
+
     def _small(self, text: str) -> QLabel:
         l = QLabel(text)
         l.setFont(QFont("Segoe UI", 8))
         l.setStyleSheet(f"color: {MUTED};")
         return l
+
+    def _disk_label(self) -> str:
+        path = (getattr(self.watcher, "disk_path", "") or "").strip()
+        if not path:
+            return ""
+        if len(path) >= 2 and path[1] == ":":
+            return path[:2]
+        return path
+
+    def _has_real_pid(self) -> bool:
+        return str(self._cur_pid).isdigit()
+
+    def _resolve_action_pid(self):
+        """Find a numeric PID for kill action from UI/state/fallback sources."""
+        if self._has_real_pid():
+            return int(self._cur_pid)
+
+        import re
+
+        # 1) RCA badge text: "Alert PID: 12345"
+        try:
+            txt = self.rca.pid_lbl.text() or ""
+            m = re.search(r"(\d+)", txt)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            pass
+
+        # 2) Last RCA body text may include "PID 12345"
+        try:
+            txt = self._last_rca or ""
+            m = re.search(r"\bPID\D*(\d+)\b", txt, re.IGNORECASE)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            pass
+
+        # 3) Live fallback from diagnostics tools
+        try:
+            pid = self.worker._fallback_pid()
+            if str(pid).isdigit():
+                return int(pid)
+        except Exception:
+            pass
+
+        return None
+
+    def _describe_pid(self, pid: int) -> dict:
+        """Return best-effort live details for a PID."""
+        details = {"name": "unknown", "exe": "(unavailable)", "cmd": "(unavailable)"}
+        try:
+            proc = psutil.Process(pid)
+            details["name"] = proc.name() or "unknown"
+            try:
+                details["exe"] = proc.exe() or "(unavailable)"
+            except Exception:
+                pass
+            try:
+                cmdline = proc.cmdline()
+                details["cmd"] = " ".join(cmdline) if cmdline else "(unavailable)"
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return details
 
     def _set_incident_spotlight(self, badge: str, badge_color: str, title: str, detail: str):
         self.incident_badge.setText(badge)
@@ -1107,7 +1405,7 @@ class MainWindow(QMainWindow):
         menu.addAction("⚡ Open Dashboard",    self.show_window)
         menu.addAction("📋 Show Last RCA",     self._show_rca_toast)
         menu.addSeparator()
-        menu.addAction("▶ Simulate Spike",     self._simulate)
+        menu.addAction("▶ Run Live AI Check",  self._simulate)
         menu.addSeparator()
         menu.addAction("✕ Quit",               self._quit)
         self.tray.setContextMenu(menu)
@@ -1145,9 +1443,12 @@ class MainWindow(QMainWindow):
                            f"{psutil.cpu_count()} cores")
         self.card_ram.push(m["memory_usage"],
                            f"{mem.used/1e9:.1f} / {mem.total/1e9:.1f} GB")
-        disk = psutil.disk_usage("/")
+        try:
+            disk = psutil.disk_usage(self.watcher.disk_path)
+        except Exception:
+            disk = psutil.disk_usage("/")
         self.card_disk.push(m["disk_usage"],
-                            f"{disk.used/1e9:.0f} / {disk.total/1e9:.0f} GB")
+                            f"{disk.used/(1024**3):.1f} / {disk.total/(1024**3):.1f} GiB")
         pct = min(100, m["process_count"] / self.watcher.process_count_threshold * 100)
         self.card_proc.push(pct, f"{m['process_count']} processes")
 
@@ -1155,13 +1456,37 @@ class MainWindow(QMainWindow):
         _skip_pids   = {0, 4}
         _skip_names  = {"system idle process", "system", "registry", "memory compression"}
         rows = []
-        for p in psutil.process_iter(["pid","name","cpu_percent","memory_percent","status"]):
-            try:
-                info = p.info
-                if info["pid"] in _skip_pids: continue
-                if (info.get("name") or "").lower() in _skip_names: continue
-                rows.append(info)
-            except: pass
+        try:
+            # Fetch process fields in guarded per-process calls. This avoids UI hangs on
+            # protected system processes that can intermittently raise AccessDenied.
+            for p in psutil.process_iter():
+                try:
+                    pid = p.pid
+                    if pid in _skip_pids:
+                        continue
+
+                    name = p.name() or "(unknown)"
+                    if name.lower() in _skip_names:
+                        continue
+
+                    cpu = p.cpu_percent(interval=None)
+                    try:
+                        mem_pct = p.memory_percent()
+                    except Exception:
+                        mem_pct = 0.0
+
+                    rows.append({
+                        "pid": pid,
+                        "name": name,
+                        "cpu_percent": cpu,
+                        "memory_percent": mem_pct,
+                    })
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+                except Exception:
+                    continue
+        except Exception as e:
+            _write_runtime_log("WARN", f"Process table refresh failed: {e}")
         rows.sort(key=lambda x: x["cpu_percent"] or 0, reverse=True)
         self.proctable.update_procs(rows)
 
@@ -1211,7 +1536,12 @@ class MainWindow(QMainWindow):
         self._cur_pid = pid
         self._last_rca = rca
         self._pid_icon.setText("⚠️")
-        self._pid_text.setText(f"Culprit: PID {pid} — action needed")
+        if str(pid).isdigit():
+            info = self._describe_pid(int(pid))
+            self._pid_text.setText(f"Culprit: {info['name']} (PID {pid}) — action needed")
+            self._pid_text.setToolTip(f"EXE: {info['exe']}\nCMD: {info['cmd']}")
+        else:
+            self._pid_text.setText(f"Culprit: PID {pid} — action needed")
         self._pid_text.setStyleSheet(f"color: {YELLOW}; background: transparent;")
         self._set_incident_spotlight(
             "🟠 Action Needed",
@@ -1272,7 +1602,7 @@ class MainWindow(QMainWindow):
                 "Investigation finished. Building your RCA summary.",
                 "The final report will explain what happened and what to do next in simple language."
             )
-        elif state == "done" and not self._cur_pid:
+        elif state == "done" and not self._has_real_pid():
             self._set_incident_spotlight(
                 "✅ Investigation Complete",
                 GREEN,
@@ -1290,36 +1620,58 @@ class MainWindow(QMainWindow):
 
     # ── ACTIONS ───────────────────────────────────────────────
     def _simulate(self):
-        self.log.add("WARN", "🐒 Simulating CPU_SPIKE incident…")
+        if getattr(self.worker, "_incident", False):
+            self.log.add("INFO", "AI is already investigating an incident. Please wait for it to finish.")
+            return
+
+        self.log.add("INFO", "▶ Running manual live AI check from current system metrics…")
         self.thoughts.clear_thoughts()
         self._on_agent_state("triggered")
-        fake = {
-            "primary_event": "CPU_SPIKE", "detected_events": ["CPU_SPIKE"],
-            "cpu_usage": 91.0, "memory_usage": 88.0, "disk_usage": 45.0,
-            "process_count": 318,
-            "recent_logs": ["High CPU usage detected in python.exe"],
-            "steps_taken": [],
-        }
+
+        metrics = self.watcher.get_metrics()
+        primary_event, detected = self.watcher.detect_events(metrics)
+        if primary_event == "NORMAL":
+            primary_event = "MANUAL_HEALTH_CHECK"
+            detected = ["MANUAL_HEALTH_CHECK"]
+
+        live_ctx = self.ctx_builder.build_context(metrics, primary_event, detected)
+        self.worker._incident = True
+
         # trigger worker inline
-        t = threading.Thread(target=self.worker._run_agent, args=(fake,), daemon=True)
+        t = threading.Thread(target=self.worker._run_agent, args=(live_ctx,), daemon=True)
         t.start()
 
     def _kill_pid(self):
-        if self._cur_pid:
-            self.log.add("OK", f"Sending SIGTERM to PID {self._cur_pid}…")
-            try:
-                import signal as _sig
-                os.kill(int(self._cur_pid), _sig.SIGTERM)
-                self.log.add("OK", f"✅ PID {self._cur_pid} successfully terminated.")
-            except Exception as e:
-                self.log.add("INFO", f"Kill attempt PID {self._cur_pid}: {e}")
-            self._cur_pid = None
-            self._pid_icon.setText("✅")
-            self._pid_text.setText("Process terminated successfully")
-            self._pid_text.setStyleSheet(f"color: {GREEN}; background: transparent;")
-            self.worker.reset()
-        else:
-            self.log.add("INFO", "No active process to stop — system is healthy.")
+        pid = self._resolve_action_pid()
+        if pid is None:
+            self.log.add("INFO", "No numeric PID is available yet. Wait for analysis to finish, then try again.")
+            return
+
+        if pid in (0, 4):
+            self.log.add("ERR", f"Refusing to terminate protected system PID {pid}.")
+            return
+
+        if pid == os.getpid():
+            self.log.add("ERR", "Refusing to terminate the SysAdmin app process itself.")
+            return
+
+        info = self._describe_pid(pid)
+        self._cur_pid = str(pid)
+        self.log.add("OK", f"Target process: {info['name']} (PID {pid})")
+        self.log.add("INFO", f"EXE: {info['exe']}")
+        self.log.add("INFO", f"CMD: {info['cmd'][:180]}")
+        self.log.add("OK", f"Sending SIGTERM to {info['name']} (PID {pid})…")
+        try:
+            import signal as _sig
+            os.kill(pid, _sig.SIGTERM)
+            self.log.add("OK", f"✅ {info['name']} (PID {pid}) successfully terminated.")
+        except Exception as e:
+            self.log.add("INFO", f"Kill attempt PID {pid}: {e}")
+        self._cur_pid = None
+        self._pid_icon.setText("✅")
+        self._pid_text.setText("Process terminated successfully")
+        self._pid_text.setStyleSheet(f"color: {GREEN}; background: transparent;")
+        self.worker.reset()
 
     def _send_slack(self):
         webhook = os.getenv("SLACK_WEBHOOK_URL", "").strip()
@@ -1478,9 +1830,28 @@ class MainWindow(QMainWindow):
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
+    def _uncaught_excepthook(exc_type, exc_value, exc_tb):
+        _write_runtime_log(
+            "CRASH",
+            "".join(traceback.format_exception(exc_type, exc_value, exc_tb)).strip()
+        )
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _uncaught_excepthook
+
     app = QApplication(sys.argv)
     app.setApplicationName("Autonomous SysAdmin")
     app.setQuitOnLastWindowClosed(False)   # keep running in tray
     win = MainWindow()
     win.show()
-    sys.exit(app.exec())
+    rc = 0
+    try:
+        rc = app.exec()
+    except KeyboardInterrupt:
+        # Ctrl+C from terminal should exit cleanly, not look like an app crash.
+        try:
+            win._quit()
+        except Exception:
+            pass
+        rc = 0
+    sys.exit(rc)

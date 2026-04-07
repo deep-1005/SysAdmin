@@ -14,16 +14,25 @@ via a tray icon notification + Slack message.
 :: 1. Install deps
 pip install -r requirements.txt
 
-:: 2. Set your secrets
-copy .env.example .env
-:: Edit .env and fill in your keys
+:: 2. Configure .env
+:: Make sure these values exist:
+:: OLLAMA_URL=http://localhost:11434/api/generate
+:: OLLAMA_MODEL=qwen2.5:0.5b
+:: OLLAMA_MODELS=E:\ollama\models
+:: If Ollama is on drive E, also set:
+:: OLLAMA_EXE=E:\Program Files\Ollama\ollama.exe
 
-:: 3. Launch full dashboard
+:: 3. Ensure Ollama model is available
+ollama pull qwen2.5:0.5b
+
+:: 4. Launch full dashboard
 python app.py
 
-:: 4. OR start as background tray daemon (minimised)
+:: 5. OR start as background tray daemon (minimised)
 python app.py --tray
 ```
+
+The app now attempts to auto-start Ollama if it is installed but not running.
 
 ---
 

@@ -10,7 +10,7 @@ Shows a colour-coded icon in the Windows taskbar tray:
 Right-click menu:
   • Open Dashboard   → brings Textual TUI to foreground
   • Last RCA         → Windows toast notification with RCA text
-  • Simulate Spike   → triggers a fake CPU spike for demo
+    • Run Live AI Check → triggers an immediate AI analysis using live metrics
   • Quit             → shuts down everything
 
 Dependencies:
@@ -117,7 +117,7 @@ class TrayController:
             Item("Open Dashboard",        self._do_open),
             Item("Show Last RCA",         self._do_show_rca),
             pystray.Menu.SEPARATOR,
-            Item("🐒 Simulate CPU Spike", self._do_simulate),
+            Item("▶ Run Live AI Check",    self._do_simulate),
             pystray.Menu.SEPARATOR,
             Item("Quit",                  self._do_quit),
         )

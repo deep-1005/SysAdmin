@@ -8,7 +8,7 @@ Launch:
     python app.py --tray    ← tray-only mode (minimised, background daemon)
 
 Keyboard shortcuts inside TUI:
-    D   Simulate CPU spike (demo)
+    D   Run live AI check now
     K   Kill culprit PID
     S   Send RCA to Slack
     M   Minimise to tray
@@ -211,7 +211,7 @@ class StatusStrip(Static):
             f" [grey58]uptime[/grey58] [bright_white]{h:02d}:{m:02d}:{s:02d}[/bright_white]"
             f"   [grey58]event[/grey58] [{ec}]{self._event}[/{ec}]"
             f"   [grey58]pid[/grey58] [yellow]{self._pid}[/yellow]"
-            f"   [grey58][D] demo  [K] kill  [S] slack  [M] tray  [R] reset  [Q] quit[/grey58]"
+            f"   [grey58][D] live-check  [K] kill  [S] slack  [M] tray  [R] reset  [Q] quit[/grey58]"
         )
 
 
@@ -224,7 +224,7 @@ class SysAdminApp(App):
     SUB_TITLE = "Windows Native  •  AI Incident Detection"
 
     BINDINGS = [
-        ("d", "demo",       "Simulate"),
+        ("d", "demo",       "Live Check"),
         ("k", "kill_pid",   "Kill PID"),
         ("s", "slack",      "Slack"),
         ("m", "minimise",   "Minimise to tray"),
@@ -308,9 +308,19 @@ class SysAdminApp(App):
 
         # process table
         rows = []
-        for p in psutil.process_iter(["pid","name","cpu_percent","memory_percent","status"]):
-            try: rows.append(p.info)
-            except: pass
+        for p in psutil.process_iter():
+            try:
+                rows.append({
+                    "pid": p.pid,
+                    "name": p.name() or "(unknown)",
+                    "cpu_percent": p.cpu_percent(interval=None),
+                    "memory_percent": p.memory_percent(),
+                    "status": p.status(),
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            except Exception:
+                continue
         rows.sort(key=lambda x: x["cpu_percent"] or 0, reverse=True)
         self.query_one("#procs", ProcTable).update(rows)
 
@@ -438,22 +448,46 @@ class SysAdminApp(App):
 
     # ── key actions ───────────────────────────────────────────
     def action_demo(self) -> None:
-        self._log("WARN", "🐒 Simulating CPU_SPIKE…")
-        fake = {
-            "primary_event": "CPU_SPIKE", "detected_events": ["CPU_SPIKE"],
-            "cpu_usage": 91.0, "memory_usage": 88.0, "disk_usage": 45.0,
-            "process_count": 318, "recent_logs": ["High CPU in python.exe"],
-            "steps_taken": [],
-        }
-        self._start_incident(fake)
+        if self._incident:
+            self._log("INFO", "AI is already investigating. Please wait before running another live check.")
+            return
+
+        self._log("INFO", "▶ Running manual live AI check from current metrics…")
+        m = self.watcher.get_metrics()
+        ev, evs = self.watcher.detect_events(m)
+        if ev == "NORMAL":
+            ev, evs = "MANUAL_HEALTH_CHECK", ["MANUAL_HEALTH_CHECK"]
+        ctx = self.ctx_builder.build_context(m, ev, evs)
+        self._start_incident(ctx)
 
     def action_kill_pid(self) -> None:
         if self._cur_pid:
-            self._log("OK", f"Sending SIGTERM to PID {self._cur_pid}…")
+            pid = int(self._cur_pid)
+            if pid in (0, 4):
+                self._log("ERR", f"Refusing to terminate protected system PID {pid}.")
+                return
+            if pid == os.getpid():
+                self._log("ERR", "Refusing to terminate the SysAdmin process itself.")
+                return
+
+            try:
+                proc = psutil.Process(pid)
+                name = proc.name() or "unknown"
+                exe = proc.exe() or "(unavailable)"
+                cmd = " ".join(proc.cmdline()) if proc.cmdline() else "(unavailable)"
+            except Exception:
+                name = "unknown"
+                exe = "(unavailable)"
+                cmd = "(unavailable)"
+
+            self._log("OK", f"Target process: {name} (PID {pid})")
+            self._log("INFO", f"EXE: {exe}")
+            self._log("INFO", f"CMD: {cmd[:180]}")
+            self._log("OK", f"Sending SIGTERM to {name} (PID {pid})…")
             try:
                 import signal as _sig
-                os.kill(int(self._cur_pid), _sig.SIGTERM)
-                self._log("OK", f"PID {self._cur_pid} terminated.")
+                os.kill(pid, _sig.SIGTERM)
+                self._log("OK", f"{name} (PID {pid}) terminated.")
             except Exception as e:
                 self._log("INFO", f"Kill simulation (PID {self._cur_pid}): {e}")
             self._cur_pid = None

@@ -1,6 +1,15 @@
 class ContextBuilder:
     def __init__(self, log_file="logs/system.log"):
         self.log_file = log_file
+        # Seed/demo lines that can exist in a fresh project log file.
+        # They should not continuously trigger production alerts.
+        self._seed_lines = {
+            "system boot complete",
+            "connection refused from localhost:5000",
+            "out of memory: killed process 4213 (python)",
+            "disk warning: write latency increasing",
+            "segmentation fault in service.exe",
+        }
 
     def read_recent_logs(self, num_lines=5):
         try:
@@ -22,6 +31,8 @@ class ContextBuilder:
 
         for log in logs:
             lower_log = log.lower()
+            if lower_log in self._seed_lines:
+                continue
             for keyword in alert_keywords:
                 if keyword in lower_log:
                     return True

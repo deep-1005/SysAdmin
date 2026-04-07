@@ -1,3 +1,5 @@
+import os
+import sys
 import psutil
 
 
@@ -7,22 +9,23 @@ class Watcher:
         cpu_threshold=80,
         memory_threshold=85,
         disk_threshold=95,          # raised — Windows C: drives often sit at 90%+
-        process_count_threshold=300
+        process_count_threshold=300,
+        disk_path=None,
     ):
         self.cpu_threshold = cpu_threshold
         self.memory_threshold = memory_threshold
         self.disk_threshold = disk_threshold
         self.process_count_threshold = process_count_threshold
+        self.disk_path = disk_path or os.getenv("MONITOR_DRIVE")
+        if not self.disk_path:
+            self.disk_path = "C:\\" if sys.platform == "win32" else "/"
 
     def get_metrics(self):
         cpu_usage = psutil.cpu_percent(interval=1)
         memory_usage = psutil.virtual_memory().percent
 
-        # On Windows, use C:\ not '/' for disk
-        import sys
-        disk_path = "C:\\" if sys.platform == "win32" else "/"
         try:
-            disk_usage = psutil.disk_usage(disk_path).percent
+            disk_usage = psutil.disk_usage(self.disk_path).percent
         except Exception:
             disk_usage = psutil.disk_usage("/").percent
 
