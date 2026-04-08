@@ -1,0 +1,30 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: sysadmin-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
+  sysadmin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sysadmin-app
+    environment:
+      SYSADMIN_NO_TRAY: "1"
+      OLLAMA_URL: "http://ollama:11434/api/generate"
+      OLLAMA_MODEL: "qwen2.5:0.5b"
+    depends_on:
+      - ollama
+    volumes:
+      - ./logs:/app/logs
+    tty: true
+    stdin_open: true
+    command: ["python", "app.py", "--no-tray"]
+    restart: unless-stopped
+
+volumes:
+  ollama-data:

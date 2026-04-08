@@ -6,6 +6,7 @@ Uses psutil instead of Unix commands so it works on Windows.
 """
 import psutil
 import time
+import os
 
 
 class ToolRunner:
@@ -51,6 +52,7 @@ class ToolRunner:
 
     def _safe_process_info_with_cpu(self):
         # psutil returns 0.0 on first call; prime once, wait briefly, then sample.
+        current_pid = os.getpid()
         for p in psutil.process_iter():
             try:
                 p.cpu_percent(interval=None)
@@ -64,6 +66,8 @@ class ToolRunner:
             try:
                 info = p.as_dict(attrs=["pid", "name", "memory_percent", "status"])
                 if info.get("pid") in self.SKIP_PIDS:
+                    continue
+                if info.get("pid") == current_pid:
                     continue
                 if (info.get("name") or "").lower() in self.SKIP_NAMES:
                     continue

@@ -262,7 +262,7 @@ def _run_agentic_loop(context: dict) -> tuple:
     """
     The AI reasoning loop — Ollama reads tool output and
     decides what to investigate next. No hardcoded steps.
-    Returns: (diagnosis_text, culprit_pid)
+    Returns: (diagnosis_text, culprit_pid, tool_trace)
     """
     ev   = context["primary_event"]
     cpu  = context["cpu_usage"]
@@ -273,6 +273,7 @@ def _run_agentic_loop(context: dict) -> tuple:
     conversation = []
     pid = "N/A"
     seen_pids = set()
+    tool_trace = []
 
     # Opening prompt — give the AI the situation
     conversation.append(f"""You are a Windows system expert diagnosing a computer problem.
@@ -299,6 +300,7 @@ Investigate briefly. Start with check_processes.""")
         if tool_match:
             tool_name = tool_match.group(1).strip().lower()
             if tool_name in TOOLS:
+                tool_trace.append(f"TOOL: {tool_name}")
                 tool_output = TOOLS[tool_name]()
                 # Trust only real PIDs that appear in tool output, not model text.
                 found = _extract_pid(tool_output)
@@ -306,8 +308,10 @@ Investigate briefly. Start with check_processes.""")
                     seen_pids.add(found)
                     if pid == "N/A":
                         pid = found
+                        tool_trace.append(f"PID_CANDIDATE: {pid} (from {tool_name})")
                 conversation.append(f"Tool result ({tool_name}):\n{tool_output}")
             else:
+                tool_trace.append(f"TOOL_INVALID: {tool_name}")
                 conversation.append(
                     f"Tool '{tool_name}' does not exist. "
                     f"Available tools: {', '.join(TOOLS.keys())}"
@@ -321,14 +325,16 @@ Investigate briefly. Start with check_processes.""")
             found = _extract_pid(response)
             if found != "unknown" and found in seen_pids:
                 pid = found
-            return diagnosis, pid
+                tool_trace.append(f"PID_CONFIRMED: {pid} (from diagnosis)")
+            return diagnosis, pid, tool_trace
 
     # If 6 turns pass without DIAGNOSIS, use last response
     last  = conversation[-1].replace("Assistant: ", "")
     found = _extract_pid(" ".join(conversation))
     if found != "unknown" and found in seen_pids:
         pid = found
-    return last, pid
+        tool_trace.append(f"PID_CONFIRMED: {pid} (from conversation)")
+    return last, pid, tool_trace
 
 
 # ── RCA writer ────────────────────────────────────────────────
@@ -392,16 +398,18 @@ def _fallback_pid_from_tools() -> str:
 def run_diagnostic_crew(context: dict) -> dict:
     """
     Called by gui_app.py when an incident is detected.
-    Returns: { diagnostic_result, rca, pid, context }
+    Returns: { diagnostic_result, rca, pid, tool_trace, context }
     """
-    diagnosis, pid = _run_agentic_loop(context)
+    diagnosis, pid, tool_trace = _run_agentic_loop(context)
     if not str(pid).isdigit():
         pid = _fallback_pid_from_tools()
+        tool_trace.append(f"PID_FALLBACK: {pid} (from check_processes)")
     rca            = _write_rca(diagnosis, pid)
 
     return {
         "diagnostic_result": diagnosis,
         "rca":               rca,
         "pid":               pid,
+        "tool_trace":        tool_trace,
         "context":           context,
     }

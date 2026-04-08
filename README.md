@@ -36,6 +36,43 @@ The app now attempts to auto-start Ollama if it is installed but not running.
 
 ---
 
+## Docker setup
+
+This repo now includes Docker support for running the Textual dashboard in a container.
+
+### 1. Build and start Ollama
+
+```bash
+docker compose up -d ollama
+```
+
+### 2. Pull the model inside Ollama container
+
+```bash
+docker exec -it sysadmin-ollama ollama pull qwen2.5:0.5b
+```
+
+### 3. Run SysAdmin app
+
+```bash
+docker compose run --rm sysadmin
+```
+
+The app runs with `--no-tray` inside Docker (tray icon is disabled in containers).
+
+### 4. Stop services
+
+```bash
+docker compose down
+```
+
+### Important limitation (Windows host monitoring)
+
+Inside Docker, `psutil` reads container-level metrics, not full host Windows metrics.
+For full Windows desktop monitoring + tray integration, run natively with `python app.py` or `python gui_app.py`.
+
+---
+
 ## Keyboard shortcuts (inside TUI)
 
 | Key | Action |

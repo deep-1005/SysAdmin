@@ -36,7 +36,29 @@ from rich.panel        import Panel
 from watcher         import Watcher
 from context_builder import ContextBuilder
 from tool_runner     import ToolRunner
-from tray            import TrayController
+try:
+    from tray import TrayController
+except Exception:
+    TrayController = None
+
+
+class NoopTrayController:
+    """Headless-safe tray adapter used when system tray is unavailable."""
+
+    def start(self):
+        return None
+
+    def stop(self):
+        return None
+
+    def set_status(self, status: str):
+        return None
+
+    def set_last_rca(self, rca_text: str):
+        return None
+
+    def notify(self, title: str, message: str):
+        return None
 
 # ── config ────────────────────────────────────────────────────
 POLL_INTERVAL  = 2      # seconds between watcher polls
@@ -533,18 +555,28 @@ def main():
     parser = argparse.ArgumentParser(description="Autonomous SysAdmin")
     parser.add_argument("--tray", action="store_true",
                         help="Start minimised (tray only, no TUI window)")
+    parser.add_argument("--no-tray", action="store_true",
+                        help="Disable system tray integration (useful for Docker/headless runs)")
     args = parser.parse_args()
+
+    no_tray = args.no_tray or os.getenv("SYSADMIN_NO_TRAY", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
 
     # Build tray — we need the app reference for the restore callback,
     # so we wire it up after construction.
     app_ref: list = []   # mutable container so lambda can capture it
 
-    tray = TrayController(
-        on_simulate=lambda: app_ref[0].call_from_thread(app_ref[0].action_demo),
-        on_quit=lambda:     app_ref[0].call_from_thread(app_ref[0].action_quit_app),
-        on_open_dashboard=lambda: app_ref[0].call_from_thread(app_ref[0].resume),
-    )
-    tray.start()
+    if no_tray or TrayController is None:
+        tray = NoopTrayController()
+        print("SysAdmin AI running without tray integration.")
+    else:
+        tray = TrayController(
+            on_simulate=lambda: app_ref[0].call_from_thread(app_ref[0].action_demo),
+            on_quit=lambda:     app_ref[0].call_from_thread(app_ref[0].action_quit_app),
+            on_open_dashboard=lambda: app_ref[0].call_from_thread(app_ref[0].resume),
+        )
+        tray.start()
 
     app = SysAdminApp(tray=tray)
     app_ref.append(app)
