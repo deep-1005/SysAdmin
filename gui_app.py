@@ -9,10 +9,14 @@ Run:   python gui_app.py
 Build: pyinstaller --onefile --windowed --icon=icon.ico gui_app.py
 """
 
-import sys, os, time, threading, subprocess
+import sys, os, time, threading
 import traceback
 from datetime import datetime
 from collections import deque
+from env_loader import ensure_env_loaded
+from process_killer import terminate_process_tree
+
+ensure_env_loaded()
 
 import psutil
 from PyQt6.QtWidgets import (
@@ -71,7 +75,7 @@ TEXT_DIM      = "#3d6b5e"
 
 # Backward-compatible aliases used throughout the file.
 BG_DEEP    = BG_BASE
-BG_CARD    = BG_CARD
+BG_PANEL   = BG_CARD
 BG_CARD2   = BG_ELEVATED
 BORDER     = BORDER_DIM
 BORDER_LIT = BORDER_MID
@@ -383,7 +387,7 @@ class BrandHero(QWidget):
         top.addWidget(right, alignment=Qt.AlignmentFlag.AlignVCenter)
         shell_lay.addLayout(top)
 
-        self.helper = QLabel("LOCAL OLLAMA  WINDOWS NATIVE  LIVE SYSTEM WATCH")
+        self.helper = QLabel("LOCAL CREWAI  WINDOWS NATIVE  LIVE SYSTEM WATCH")
         self.helper.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.helper.setFont(QFont("Century Gothic", 8, QFont.Weight.Bold))
         self.helper.setStyleSheet(f"color: {MUTED2}; background: transparent; letter-spacing: 2px;")
@@ -1495,7 +1499,7 @@ class WatcherWorker(QThread):
 
     def _extract_pid_from_text(self, text: str) -> str:
         import re
-        for m in re.finditer(r"PID[=:\\s]+(\\d+)", text, re.IGNORECASE):
+        for m in re.finditer(r"PID[=:\s]+(\d+)", text, re.IGNORECASE):
             p = m.group(1)
             if p not in ("0", "4"):
                 return p
@@ -1548,17 +1552,17 @@ class WatcherWorker(QThread):
         self.sig.log_line.emit("ERR",  f"INCIDENT – {ev}")
         self.sig.log_line.emit("WARN", f"CPU={ctx['cpu_usage']}% – RAM={ctx['memory_usage']}%")
         self.sig.agent_state.emit("detective")
-        self.sig.thought.emit("", f"❄️ Trigger [{ev}] – handing off to local Ollama AI agent...")
+        self.sig.thought.emit("", f"❄️ Trigger [{ev}] – handing off to local CrewAI agent...")
         self.sig.thought.emit("", "🧬 Detective agent starting diagnostic chain...")
 
         try:
             #  REAL AI CALL 
-            # This is where the local Ollama model decides which tools to call.
+            # This is where the local CrewAI crew decides which tools to call.
             # It reads check_processes output and CHOOSES what to do next.
             from detective_agent import run_diagnostic_crew
 
             self.sig.thought.emit("", "💡 Local AI is analyzing your system – this may take 15–30 seconds...")
-            self.sig.log_line.emit("INFO", "Ollama AI agent running – analyzing live system data...")
+            self.sig.log_line.emit("INFO", "CrewAI agent running – analyzing live system data...")
 
             result = self._run_diagnostic_crew_with_timeout(
                 run_diagnostic_crew,
@@ -1601,22 +1605,22 @@ class WatcherWorker(QThread):
             # Runtime setup/model issue  show friendly message
             self.sig.agent_state.emit("idle")
             self.sig.thought.emit("", str(e))
-            self.sig.log_line.emit("ERR", "Ollama runtime is not ready or model load failed.")
-            self.sig.log_line.emit("INFO", "Check: ollama serve  and  ollama list")
+            self.sig.log_line.emit("ERR", "CrewAI runtime is not ready or the model load failed.")
+            self.sig.log_line.emit("INFO", "Check: Python 3.12 environment, then run ollama serve")
             _write_runtime_log("ERR", f"RuntimeError in _run_agent: {e}\n{traceback.format_exc()}")
             self._incident = False
 
         except TimeoutError:
-            # If Ollama stalls, fail fast and keep the dashboard responsive.
+            # If the crew stalls, fail fast and keep the dashboard responsive.
             self.sig.agent_state.emit("reporter")
-            self.sig.thought.emit("", "Ollama took too long. Falling back to the local rule-based report.")
-            self.sig.log_line.emit("WARN", "Ollama timed out  using fallback RCA so the dashboard stays responsive.")
+            self.sig.thought.emit("", "CrewAI took too long. Falling back to the local rule-based report.")
+            self.sig.log_line.emit("WARN", "CrewAI timed out  using fallback RCA so the dashboard stays responsive.")
             rca = self._build_rca(ctx)
             pid = self._cur_pid or self._fallback_pid()
             self._cur_pid = pid
             self.sig.rca_ready.emit(rca, pid)
             self.sig.agent_state.emit("done")
-            _write_runtime_log("WARN", "Ollama timeout in _run_agent; fallback RCA used.")
+            _write_runtime_log("WARN", "CrewAI timeout in _run_agent; fallback RCA used.")
             self._incident = False
 
         except Exception as e:
@@ -1728,10 +1732,11 @@ class MainWindow(QMainWindow):
         self._pending_rectify_active = False
         self._pending_rectify_pid = ""
         self._pending_rectify_rca = ""
+        self._slack_current_pid = ""
+        self._slack_initial_sent = False
+        self._slack_followup_sent = False
         self._latest_metrics = {}
         self._latest_event = "NORMAL"
-        self._last_slack_urgent_sent_at = 0.0
-        self._slack_urgent_cooldown_s = 60 * 60
 
         self._build_ui()
         self._setup_tray()
@@ -1766,6 +1771,19 @@ class MainWindow(QMainWindow):
                 self.log.add("WARN", f"Disk C: is at {disk_pct:.1f}%  consider freeing space soon.")
         except Exception:
             pass
+
+    def _stop_rectify_timer(self):
+        timer = getattr(self, "_rectify_reminder_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+
+    def _start_rectify_timer(self, delay_ms: int):
+        timer = getattr(self, "_rectify_reminder_timer", None)
+        if timer is None:
+            return
+        if timer.isActive():
+            timer.stop()
+        timer.start(delay_ms)
 
     #  UI BUILD 
     def _build_ui(self):
@@ -1921,7 +1939,7 @@ class MainWindow(QMainWindow):
         self.health_lbl.setStyleSheet(f"color: {MUTED2}; background: transparent;")
         hl.addWidget(self.health_lbl)
         hl.addStretch()
-        self.ai_status_lbl = QLabel(" AI: Ready  (Ollama)")
+        self.ai_status_lbl = QLabel(" AI: Ready  (CrewAI)")
         self.ai_status_lbl.setFont(QFont("Century Gothic", 8))
         self.ai_status_lbl.setStyleSheet(f"color: {MUTED}; background: transparent;")
         hl.addWidget(self.ai_status_lbl)
@@ -2174,7 +2192,7 @@ class MainWindow(QMainWindow):
             "<b style='color:#00c3ff'>How it works:</b>  "
             "The app watches your computer in the background. If something looks wrong, it checks the busiest apps, "
             "explains the likely cause in plain English, and suggests the next safest action. "
-            "<span style='color:#64748b'>  Local Ollama model  no browser  no cloud required.</span>"
+            "<span style='color:#64748b'>  Local CrewAI crew  no browser  no cloud required.</span>"
         )
         ai_text.setFont(QFont("Century Gothic", 8))
         ai_text.setStyleSheet(f"color: {MUTED2}; background: transparent;")
@@ -2334,7 +2352,7 @@ class MainWindow(QMainWindow):
         # 1) RCA badge text: "Alert PID: 12345"
         try:
             txt = self.rca.pid_lbl.text() or ""
-            m = re.search(r"(\d+)", txt)
+            m = re.search(r"\bAlert\s*PID\s*[:=#-]?\s*(\d{2,7})\b", txt, re.IGNORECASE)
             if m:
                 pid = int(m.group(1))
                 if pid not in (0, 4, current_pid):
@@ -2345,7 +2363,7 @@ class MainWindow(QMainWindow):
         # 2) Last RCA body text may include "PID 12345"
         try:
             txt = self._last_rca or ""
-            m = re.search(r"\bPID\D*(\d+)\b", txt, re.IGNORECASE)
+            m = re.search(r"\bPID\s*[:=#-]?\s*(\d{2,7})\b", txt, re.IGNORECASE)
             if m:
                 pid = int(m.group(1))
                 if pid not in (0, 4, current_pid):
@@ -2363,6 +2381,24 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        return None
+
+    def _fallback_live_pid(self, blocked: set[int]):
+        """Pick a live PID from top-process output, excluding blocked PIDs."""
+        import re
+
+        try:
+            out = self.runner.check_processes()
+        except Exception:
+            return None
+
+        for match in re.finditer(r"PID[=:\s]+(\d+)", out, re.IGNORECASE):
+            try:
+                pid = int(match.group(1))
+            except Exception:
+                continue
+            if pid not in blocked:
+                return pid
         return None
 
     def _describe_pid(self, pid: int) -> dict:
@@ -2519,7 +2555,6 @@ class MainWindow(QMainWindow):
                                     if r == QSystemTrayIcon.ActivationReason.DoubleClick else None)
         self.tray.show()
         self._last_rca = ""
-        self._slack_auto_sent = False
 
     def show_window(self):
         self._show_dashboard()
@@ -2650,14 +2685,18 @@ class MainWindow(QMainWindow):
             self.thinking_indicator.set_active(True, CYAN)
 
     def _on_rca(self, rca: str, pid: str):
+        pid_key = str(pid)
+        if pid_key != self._slack_current_pid:
+            self._slack_current_pid = pid_key
+            self._slack_initial_sent = False
+            self._slack_followup_sent = False
+            self._stop_rectify_timer()
+
         self._cur_pid = pid
         self._last_rca = rca
-        self._slack_auto_sent = False
         self._pending_rectify_active = False
         self._pending_rectify_pid = str(pid)
         self._pending_rectify_rca = rca or ""
-        if hasattr(self, "_rectify_reminder_timer"):
-            self._rectify_reminder_timer.stop()
         self._pid_icon.setText("")
         self._pid_icon.setStyleSheet(f"color: {ACCENT_RED}; background: transparent;")
         if str(pid).isdigit():
@@ -2677,26 +2716,25 @@ class MainWindow(QMainWindow):
         )
         self.rca.show_rca(rca, pid)
         self._position_rca_popup()
-        urgent, reason = self._should_send_urgent_slack()
-        if urgent:
-            self.log.add("WARN", f"Urgent incident detected ({reason}). Sending Slack alert.")
-            QTimer.singleShot(250, lambda: self._auto_send_slack_from_alert(rca, pid))
+        urgent, reason = self._is_slack_urgent()
+        if not self._slack_initial_sent:
+            if urgent:
+                self.log.add("WARN", f"Urgent incident detected ({reason}). Sending Slack alert.")
+            else:
+                self.log.add("INFO", f"Incident below urgent threshold ({reason}). Sending a single Slack alert only.")
+            QTimer.singleShot(250, lambda: self._auto_send_slack_from_alert(rca, pid, urgent))
         else:
-            self.log.add("INFO", "Slack alert skipped: incident not urgent enough.")
-            self.rca.set_slack_status("Slack: skipped (not urgent)", MUTED2)
+            self.log.add("INFO", f"Slack alert already sent for PID {pid}; suppressing repeats.")
+            if not urgent and not self._slack_followup_sent:
+                self._start_rectify_timer(60 * 60 * 1000 * 2)
         self.tray.showMessage(
             " Incident Detected",
             f"PID {pid} identified. Click to open dashboard.",
             QSystemTrayIcon.MessageIcon.Warning, 6000
         )
 
-    def _should_send_urgent_slack(self):
-        """Return (should_send, reason) based on strict urgency rules + cooldown."""
-        now = time.time()
-        if now - self._last_slack_urgent_sent_at < self._slack_urgent_cooldown_s:
-            remain = int((self._slack_urgent_cooldown_s - (now - self._last_slack_urgent_sent_at)) / 60)
-            return False, f"cooldown ({remain}m remaining)"
-
+    def _is_slack_urgent(self):
+        """Return (is_urgent, reason) based on strict urgency rules."""
         m = self._latest_metrics or {}
         ev = self._latest_event or "NORMAL"
         cpu = float(m.get("cpu_usage", 0.0) or 0.0)
@@ -2733,31 +2771,35 @@ class MainWindow(QMainWindow):
             return True, "compute slowdown from process overload"
         return False, "below urgent thresholds"
 
-    def _auto_send_slack_from_alert(self, rca_text: str, pid: str):
-        if self._slack_auto_sent:
+    def _auto_send_slack_from_alert(self, rca_text: str, pid: str, urgent: bool):
+        if self._slack_initial_sent:
             return
-        self._slack_auto_sent = True
+        self._slack_initial_sent = True
         self.log.add("INFO", "Sending Slack alert...")
         self.rca.set_slack_status("Slack: sending incident report", ACCENT_CYAN)
+        severity = "URGENT" if urgent else "NOTICE"
         decision_text = (
-            f"Main cause identified: PID {pid}.\n"
+            f"[{severity}] Main cause identified: PID {pid}.\n"
             f"{rca_text}\n\n"
             "Action required: rectify now?"
         )
         ok, code, message = self._send_slack_payload(decision_text)
         if ok:
-            self._last_slack_urgent_sent_at = time.time()
             self.log.add("OK", "Sent the alert!")
-            self.rca.set_slack_status("Slack: cause sent. Waiting for user decision", GREEN)
+            if urgent:
+                self.rca.set_slack_status("Slack: urgent alert sent", GREEN)
+            else:
+                self.rca.set_slack_status("Slack: notice sent; follow-up in 2 hours", GREEN)
+                self._start_rectify_timer(60 * 60 * 1000 * 2)
             self._ask_rectify_decision(pid)
         elif code == "missing-webhook":
             self.log.add("WARN", "Slack webhook not configured. Auto-send skipped.")
             self.rca.set_slack_status("Slack: webhook not configured", ACCENT_AMBER)
-            self._slack_auto_sent = False
+            self._slack_initial_sent = False
         else:
             self.log.add("ERR", f"Slack auto-send failed: {message}")
             self.rca.set_slack_status("Slack: send failed", ACCENT_RED)
-            self._slack_auto_sent = False
+            self._slack_initial_sent = False
 
     def _ask_rectify_decision(self, pid: str):
         from PyQt6.QtWidgets import QMessageBox
@@ -2774,23 +2816,22 @@ class MainWindow(QMainWindow):
         if result == QMessageBox.StandardButton.Yes:
             self.log.add("INFO", "User chose to rectify now.")
             self._pending_rectify_active = False
-            if hasattr(self, "_rectify_reminder_timer"):
-                self._rectify_reminder_timer.stop()
+            self._stop_rectify_timer()
             if str(pid).isdigit():
                 self._cur_pid = str(pid)
             self._kill_pid()
             self._send_slack_payload(f"User selected RECTIFY. Remediation initiated for PID {pid}.")
         else:
-            self.log.add("WARN", "User postponed rectify. Reminder scheduled in 1 hour.")
+            self.log.add("WARN", "User postponed rectify. Reminder scheduled in 2 hours.")
             self._pending_rectify_active = True
-            if hasattr(self, "_rectify_reminder_timer"):
-                self._rectify_reminder_timer.start(60 * 60 * 1000)
+            self._start_rectify_timer(60 * 60 * 1000 * 2)
 
     def _send_rectify_reminder(self):
         if not self._pending_rectify_active:
             return
         pid = self._pending_rectify_pid or "N/A"
-        self.log.add("INFO", "Sending 1-hour rectify reminder...")
+        self._slack_followup_sent = True
+        self.log.add("INFO", "Sending 2-hour follow-up reminder...")
         self.tray.showMessage(
             "Reminder",
             f"Incident for PID {pid} is still pending. Please choose Rectify or Reset.",
@@ -2838,7 +2879,7 @@ class MainWindow(QMainWindow):
         self.health_lbl.setText(msg)
         self.health_lbl.setStyleSheet(f"color: {col}; background: transparent;")
         ai_states = {
-            "idle":      " AI: Ready  (Ollama)",
+            "idle":      " AI: Ready  (CrewAI)",
             "triggered": " AI: Waking up...",
             "detective": " AI: Investigating ",
             "reporter":  " AI: Writing report ",
@@ -2929,12 +2970,20 @@ class MainWindow(QMainWindow):
             return
 
         if pid in (0, 4):
-            self.log.add("ERR", f"Refusing to terminate protected system PID {pid}.")
-            return
+            alt = self._fallback_live_pid({0, 4, os.getpid()})
+            if alt is None:
+                self.log.add("ERR", f"Refusing to terminate protected system PID {pid}.")
+                return
+            self.log.add("WARN", f"Selected PID {pid} is protected. Switching to live culprit PID {alt}.")
+            pid = alt
 
         if pid == os.getpid():
-            self.log.add("ERR", "Refusing to terminate the SysAdmin app process itself.")
-            return
+            alt = self._fallback_live_pid({0, 4, os.getpid()})
+            if alt is None:
+                self.log.add("ERR", "Refusing to terminate the SysAdmin app process itself.")
+                return
+            self.log.add("WARN", f"PID {pid} is the SysAdmin app. Switching to live culprit PID {alt}.")
+            pid = alt
 
         info = self._describe_pid(pid)
         self._cur_pid = str(pid)
@@ -2942,31 +2991,25 @@ class MainWindow(QMainWindow):
         self.log.add("INFO", f"EXE: {info['exe']}")
         self.log.add("INFO", f"CMD: {info['cmd'][:180]}")
         self.log.add("OK", f"Sending terminate signal to {info['name']} (PID {pid})")
-        try:
-            proc = psutil.Process(pid)
-            try:
-                proc.terminate()
-                proc.wait(timeout=3)
-            except psutil.TimeoutExpired:
-                self.log.add("WARN", f"PID {pid} did not exit cleanly; forcing kill.")
-                proc.kill()
-                proc.wait(timeout=3)
+        result = terminate_process_tree(pid)
+        terminated = bool(result.get("terminated"))
+
+        if terminated:
             self.log.add("OK", f"{info['name']} (PID {pid}) successfully terminated.")
-        except Exception as e:
-            self.log.add("WARN", f"psutil terminate failed for PID {pid}: {e}")
-            try:
-                subprocess.run(["taskkill", "/PID", str(pid), "/F"], check=True, capture_output=True, text=True)
-                self.log.add("OK", f"{info['name']} (PID {pid}) terminated via taskkill.")
-            except Exception as taskkill_error:
-                self.log.add("ERR", f"Unable to terminate PID {pid}: {taskkill_error}")
+        else:
+            self.log.add("ERR", f"Process {info['name']} (PID {pid}) is still running. {result.get('error', '')}")
+
         self._cur_pid = None
         self._pending_rectify_active = False
-        if hasattr(self, "_rectify_reminder_timer"):
-            self._rectify_reminder_timer.stop()
+        self._stop_rectify_timer()
         self._pid_icon.setText("")
-        self._pid_text.setText("Process terminated successfully")
-        self._pid_text.setStyleSheet(f"color: {GREEN}; background: transparent;")
-        self.worker.reset()
+        if terminated:
+            self._pid_text.setText("Process terminated successfully")
+            self._pid_text.setStyleSheet(f"color: {GREEN}; background: transparent;")
+            self.worker.reset()
+        else:
+            self._pid_text.setText("Unable to terminate process. Check permissions and try again.")
+            self._pid_text.setStyleSheet(f"color: {RED}; background: transparent;")
 
     def _send_slack(self):
         self._ui_click()
@@ -3126,12 +3169,13 @@ class MainWindow(QMainWindow):
     def _reset(self):
         self._ui_click()
         self._cur_pid = None
-        self._slack_auto_sent = False
+        self._slack_initial_sent = False
+        self._slack_followup_sent = False
+        self._slack_current_pid = ""
         self._pending_rectify_active = False
         self._pending_rectify_pid = ""
         self._pending_rectify_rca = ""
-        if hasattr(self, "_rectify_reminder_timer"):
-            self._rectify_reminder_timer.stop()
+        self._stop_rectify_timer()
         self._pid_icon.setText("")
         self._pid_icon.setStyleSheet(f"color: {TEXT_DIM}; background: transparent;")
         self._pid_text.setText("No active incident  monitoring is running normally")

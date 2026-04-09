@@ -1,30 +1,48 @@
 """
-detective_agent.py — Ollama Edition
-─────────────────────────────────────
-Runs the AI 100% locally on your laptop using Ollama.
-No API key. No internet. No quota. Completely free forever.
+detective_agent.py — CrewAI-backed incident detective
+──────────────────────────────────────────────────────
+Runs the incident response crew on a local Ollama model through CrewAI.
+The app expects Python 3.12 for CrewAI compatibility.
 
 Setup (one time):
-  1. Download Ollama from ollama.com → install it
-  2. Open a terminal and run:  ollama pull llama3.2
-  3. Run the app:              python gui_app.py
-
-Ollama must be running in the background (it starts automatically after install).
+    1. Install CrewAI in Python 3.12
+    2. Make sure Ollama is running locally
+    3. Pull a model such as qwen2.5:0.5b
 """
 import re
 import os
 import time
+import sys
 import socket
 import subprocess
 import urllib.request
 import urllib.error
 import json
+import shutil
 from urllib.parse import urlparse
-from dotenv import load_dotenv
+from typing import Any
+
+from env_loader import ensure_env_loaded
+from pydantic import BaseModel, Field
 from tool_runner import ToolRunner
 
+try:
+        from crewai import Agent as CrewAgent, Crew, LLM, Process, Task
+except Exception as crewai_import_error:  # pragma: no cover - environment dependent
+        CrewAgent = Crew = LLM = Process = Task = None
+        _CREWAI_IMPORT_ERROR = crewai_import_error
+else:
+        _CREWAI_IMPORT_ERROR = None
+
+_PY312_BRIDGE_CODE = (
+    "import json,sys;"
+    "from detective_agent import _run_diagnostic_crew_native;"
+    "ctx=json.loads(sys.stdin.read());"
+    "print(json.dumps(_run_diagnostic_crew_native(ctx)))"
+)
+
 _runner = ToolRunner()
-load_dotenv()
+ensure_env_loaded()
 
 # ── config ────────────────────────────────────────────────────
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
@@ -257,6 +275,591 @@ Rules: first call check_processes. Avoid PID 0 and System Idle Process. End with
 """
 
 
+class IncidentPlan(BaseModel):
+    urgency: str = "normal"
+    specialists: list[str] = Field(default_factory=lambda: ["process", "resources", "reporter"])
+    focus: str = "general"
+    rationale: str = ""
+    followup_hours: int = 2
+
+
+class IncidentVerdict(BaseModel):
+    candidate_pid: str = "N/A"
+    confidence: str = "medium"
+    verdict: str = ""
+    notes: str = ""
+
+
+def _create_crewai_llm() -> LLM:
+    model_name = OLLAMA_MODEL if OLLAMA_MODEL.startswith("ollama/") else f"ollama/{OLLAMA_MODEL}"
+    return LLM(
+        model=model_name,
+        base_url=_ollama_base_url(),
+        api_key=os.getenv("CREWAI_API_KEY", "ollama"),
+        temperature=0.1,
+        timeout=OLLAMA_TIMEOUT_S,
+    )
+
+
+def _collect_evidence(context: dict) -> tuple[dict[str, str], list[str], list[str]]:
+    evidence: dict[str, str] = {}
+    tool_trace: list[str] = []
+    candidate_pids: list[str] = []
+
+    process_out = TOOLS["check_processes"]()
+    evidence["check_processes"] = process_out
+    tool_trace.append("CREWAI evidence: check_processes")
+    pid = _extract_pid(process_out)
+    if pid != "unknown":
+        candidate_pids.append(pid)
+        tool_trace.append(f"PID_CANDIDATE: {pid} (check_processes)")
+
+    top_out = TOOLS["inspect_top_process"]()
+    evidence["inspect_top_process"] = top_out
+    tool_trace.append("CREWAI evidence: inspect_top_process")
+    pid2 = _extract_pid(top_out)
+    if pid2 != "unknown":
+        candidate_pids.append(pid2)
+        tool_trace.append(f"PID_CANDIDATE: {pid2} (inspect_top_process)")
+
+    ev = context.get("primary_event", "NORMAL")
+    if ev in {"CPU_SPIKE", "MEMORY_SPIKE", "DISK_SPIKE", "HIGH_PROCESS_COUNT", "LOG_ALERT"}:
+        mem_out = TOOLS["check_memory"]()
+        disk_out = TOOLS["check_disk"]()
+        evidence["check_memory"] = mem_out
+        evidence["check_disk"] = disk_out
+        tool_trace.append("CREWAI evidence: check_memory")
+        tool_trace.append("CREWAI evidence: check_disk")
+        pid3 = _extract_pid(mem_out + "\n" + disk_out)
+        if pid3 != "unknown":
+            candidate_pids.append(pid3)
+            tool_trace.append(f"PID_CANDIDATE: {pid3} (resources)")
+
+    if ev in {"HIGH_PROCESS_COUNT", "LOG_ALERT"}:
+        open_files = TOOLS["check_open_files"]()
+        net = TOOLS["check_network"]()
+        evidence["check_open_files"] = open_files
+        evidence["check_network"] = net
+        tool_trace.append("CREWAI evidence: check_open_files")
+        tool_trace.append("CREWAI evidence: check_network")
+        pid4 = _extract_pid(open_files + "\n" + net)
+        if pid4 != "unknown":
+            candidate_pids.append(pid4)
+            tool_trace.append(f"PID_CANDIDATE: {pid4} (forensics)")
+
+    return evidence, tool_trace, candidate_pids
+
+
+def _build_crewai_agents(llm: LLM) -> dict[str, CrewAgent]:
+    return {
+        "manager": CrewAgent(
+            role="Incident Manager",
+            goal="Plan the incident response from the collected system evidence.",
+            backstory="You coordinate a local Windows incident-response crew and keep the investigation focused.",
+            allow_delegation=False,
+            verbose=False,
+            llm=llm,
+        ),
+        "process": CrewAgent(
+            role="Process Specialist",
+            goal="Identify the most suspicious process and candidate PID from the process evidence.",
+            backstory="You read process lists carefully and avoid guessing when the evidence is weak.",
+            allow_delegation=False,
+            verbose=False,
+            llm=llm,
+        ),
+        "resources": CrewAgent(
+            role="Resources Specialist",
+            goal="Explain whether CPU, memory, or disk pressure is driving the incident.",
+            backstory="You translate resource pressure into actionable findings.",
+            allow_delegation=False,
+            verbose=False,
+            llm=llm,
+        ),
+        "verifier": CrewAgent(
+            role="PID Verifier",
+            goal="Cross-check the candidate PID against all evidence and reject weak matches.",
+            backstory="You are strict about evidence quality and only accept a PID when the data supports it.",
+            allow_delegation=False,
+            verbose=False,
+            llm=llm,
+        ),
+        "reporter": CrewAgent(
+            role="Incident Reporter",
+            goal="Write a concise diagnosis and plain-English summary for the operator.",
+            backstory="You turn technical findings into a clear next action for the user.",
+            allow_delegation=False,
+            verbose=False,
+            llm=llm,
+        ),
+    }
+
+
+def _run_crewai_crew(context: dict) -> tuple[str, str, list[str]]:
+    if Crew is None or Task is None or Process is None:
+        raise RuntimeError(
+            "CrewAI is not available in this Python environment. Use Python 3.12 with crewai installed.\n"
+            f"Interpreter: {sys.executable}\n"
+            f"Original import error: {_CREWAI_IMPORT_ERROR}"
+        )
+
+    ev = context["primary_event"]
+    cpu = context["cpu_usage"]
+    ram = context["memory_usage"]
+    disk = context["disk_usage"]
+    logs = "\n".join(context.get("recent_logs", [])) or "None"
+
+    evidence, tool_trace, candidate_pids = _collect_evidence(context)
+    llm = _create_crewai_llm()
+    agents = _build_crewai_agents(llm)
+    evidence_blob = json.dumps(evidence, indent=2, ensure_ascii=False)
+
+    manager_task = Task(
+        description=(
+            "Create an incident plan from this Windows evidence.\n\n"
+            f"Context:\n{json.dumps(context, indent=2, ensure_ascii=False)}\n\n"
+            f"Evidence:\n{evidence_blob}\n\n"
+            "Return JSON with urgency, specialists, focus, rationale, and followup_hours."
+        ),
+        expected_output="A JSON plan for the incident response.",
+        agent=agents["manager"],
+        output_json=IncidentPlan,
+    )
+
+    process_task = Task(
+        description=(
+            "Analyze the process evidence and identify the most likely culprit PID.\n\n"
+            f"Evidence:\n{evidence_blob}\n\n"
+            "Focus on check_processes and inspect_top_process. Do not guess if the PID is not supported."
+        ),
+        expected_output="A short process analysis that names the likely culprit PID when supported.",
+        agent=agents["process"],
+        context=[manager_task],
+    )
+
+    resources_task = Task(
+        description=(
+            "Analyze the resource pressure and explain whether CPU, memory, or disk is the main issue.\n\n"
+            f"Evidence:\n{evidence_blob}\n\n"
+            "Use only the supplied evidence. Mention the pressure pattern and its likely effect."
+        ),
+        expected_output="A short resource analysis with the most relevant pressure signal.",
+        agent=agents["resources"],
+        context=[manager_task, process_task],
+    )
+
+    verifier_task = Task(
+        description=(
+            "Verify the candidate PID against the evidence and reject weak matches.\n\n"
+            f"Candidate PIDs from evidence: {candidate_pids or ['N/A']}\n\n"
+            f"Evidence:\n{evidence_blob}\n\n"
+            "Return a concise verdict that starts with VERIFIED or NOT VERIFIED."
+        ),
+        expected_output="A verification note that confirms or rejects the candidate PID.",
+        agent=agents["verifier"],
+        context=[manager_task, process_task, resources_task],
+        output_json=IncidentVerdict,
+    )
+
+    reporter_task = Task(
+        description=(
+            "Write the final incident diagnosis for the operator.\n\n"
+            f"Alert: {ev}\nCPU={cpu}%\nRAM={ram}%\nDisk={disk}%\nLogs={logs}\n\n"
+            f"Evidence:\n{evidence_blob}\n\n"
+            "Manager plan, specialist findings, and verifier output are available in context.\n"
+            "Return exactly one DIAGNOSIS line plus 2-4 short bullets."
+        ),
+        expected_output="A technical diagnosis with one DIAGNOSIS line and short bullets.",
+        agent=agents["reporter"],
+        context=[manager_task, process_task, resources_task, verifier_task],
+    )
+
+    crew = Crew(
+        agents=list(agents.values()),
+        tasks=[manager_task, process_task, resources_task, verifier_task, reporter_task],
+        process=Process.sequential,
+        verbose=False,
+        memory=False,
+        cache=False,
+    )
+
+    crew_result = crew.kickoff()
+    manager_output = getattr(manager_task.output, "json_dict", None) or _default_crew_plan(context)
+    plan = _extract_json_object(json.dumps(manager_output), _default_crew_plan(context))
+
+    diagnosis = getattr(reporter_task.output, "raw", "") or getattr(crew_result, "raw", "") or str(crew_result)
+    verifier_raw = getattr(verifier_task.output, "raw", "")
+    process_raw = getattr(process_task.output, "raw", "")
+    resources_raw = getattr(resources_task.output, "raw", "")
+
+    final_pid = next((p for p in candidate_pids if p not in {"0", "4"}), "N/A")
+    pid_from_text = _extract_pid("\n".join([process_raw, resources_raw, verifier_raw, diagnosis]))
+    if pid_from_text != "unknown":
+        final_pid = pid_from_text
+    if not str(final_pid).isdigit():
+        final_pid = _fallback_pid_from_tools()
+        tool_trace.append(f"PID_FALLBACK: {final_pid} (from check_processes)")
+    else:
+        tool_trace.append(f"PID_VERIFIED: {final_pid}")
+
+    tool_trace.append(f"CREWAI manager plan: {plan.get('urgency', 'normal')} / {plan.get('focus', 'general')}")
+    tool_trace.append(f"CREWAI process specialist: {process_raw[:220]}")
+    tool_trace.append(f"CREWAI resources specialist: {resources_raw[:220]}")
+    tool_trace.append(f"CREWAI verifier: {verifier_raw[:220]}")
+    tool_trace.append(f"CREWAI reporter: {diagnosis[:220]}")
+
+    return diagnosis, final_pid, tool_trace
+
+
+def _python312_commands() -> list[list[str]]:
+    """Build command candidates for running a helper in Python 3.12."""
+    custom = os.getenv("CREWAI_PYTHON_EXE", "").strip()
+    candidates: list[list[str]] = []
+    if custom:
+        candidates.append([custom])
+
+    candidates.append([r"C:\Users\shankar\AppData\Local\Programs\Python\Python312\python.exe"])
+
+    py_launcher = shutil.which("py")
+    if py_launcher:
+        candidates.append([py_launcher, "-3.12"])
+
+    return candidates
+
+
+def _run_crewai_via_python312(context: dict) -> dict:
+    """Run the CrewAI diagnostic in a Python 3.12 subprocess and return parsed JSON."""
+    payload = json.dumps(context)
+    errors: list[str] = []
+
+    for base_cmd in _python312_commands():
+        try:
+            proc = subprocess.run(
+                [*base_cmd, "-c", _PY312_BRIDGE_CODE],
+                input=payload,
+                text=True,
+                capture_output=True,
+                timeout=OLLAMA_TIMEOUT_S + 30,
+            )
+        except FileNotFoundError:
+            errors.append(f"not found: {' '.join(base_cmd)}")
+            continue
+        except Exception as exc:
+            errors.append(f"failed to launch {' '.join(base_cmd)}: {exc}")
+            continue
+
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()
+            stdout = (proc.stdout or "").strip()
+            detail = stderr or stdout or f"exit code {proc.returncode}"
+            errors.append(f"{' '.join(base_cmd)} -> {detail}")
+            continue
+
+        out = (proc.stdout or "").strip()
+        if not out:
+            errors.append(f"{' '.join(base_cmd)} -> empty output")
+            continue
+
+        # Keep this tolerant: if there is extra logging, parse the last JSON object.
+        start = out.find("{")
+        end = out.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            errors.append(f"{' '.join(base_cmd)} -> invalid JSON output")
+            continue
+
+        try:
+            return json.loads(out[start:end + 1])
+        except Exception as exc:
+            errors.append(f"{' '.join(base_cmd)} -> JSON parse error: {exc}")
+            continue
+
+    raise RuntimeError(
+        "CrewAI is unavailable in this interpreter and auto-bridge to Python 3.12 failed.\n"
+        f"Current interpreter: {sys.executable}\n"
+        "Bridge attempts:\n- " + "\n- ".join(errors)
+    )
+
+
+def _run_diagnostic_crew_native(context: dict) -> dict:
+    """Native path that requires CrewAI import to be available in this interpreter."""
+    diagnosis, pid, tool_trace = _run_crewai_crew(context)
+    if not str(pid).isdigit():
+        pid = _fallback_pid_from_tools()
+        tool_trace.append(f"PID_FALLBACK: {pid} (from check_processes)")
+    rca = _write_rca(diagnosis, pid)
+    return {
+        "diagnostic_result": diagnosis,
+        "rca": rca,
+        "pid": pid,
+        "tool_trace": tool_trace,
+        "context": context,
+    }
+
+
+def _run_diagnostic_lightweight(context: dict) -> dict:
+    """Lightweight mode that skips CrewAI and uses the compact agentic loop."""
+    diagnosis, pid, tool_trace = _run_agentic_loop(context)
+    if not str(pid).isdigit():
+        pid = _fallback_pid_from_tools()
+        tool_trace.append(f"PID_FALLBACK: {pid} (from check_processes)")
+    rca = _write_rca(diagnosis, pid)
+    return {
+        "diagnostic_result": diagnosis,
+        "rca": rca,
+        "pid": pid,
+        "tool_trace": tool_trace,
+        "context": context,
+    }
+
+
+def _extract_json_object(text: str, fallback: dict) -> dict:
+    """Best-effort JSON extractor for manager/agent outputs."""
+    if not text:
+        return fallback
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return fallback
+    try:
+        return json.loads(text[start:end + 1])
+    except Exception:
+        return fallback
+
+
+def _default_crew_plan(context: dict) -> dict:
+    ev = context.get("primary_event", "NORMAL")
+    plan = {
+        "urgency": "normal",
+        "specialists": ["process", "resources", "reporter"],
+        "focus": "general",
+        "slack_policy": "single_message_then_wait",
+        "followup_hours": 2,
+    }
+    if ev == "CPU_SPIKE":
+        plan.update({"urgency": "urgent", "focus": "cpu"})
+    elif ev == "MEMORY_SPIKE":
+        plan.update({"urgency": "urgent", "focus": "memory"})
+    elif ev == "DISK_SPIKE":
+        plan.update({"urgency": "urgent", "focus": "disk"})
+    elif ev == "HIGH_PROCESS_COUNT":
+        plan.update({"urgency": "urgent", "focus": "process"})
+    elif ev == "LOG_ALERT":
+        plan.update({"urgency": "urgent", "focus": "logs"})
+    return plan
+
+
+def _manager_agent(context: dict) -> tuple[dict, str]:
+    """Manager agent decides which specialist agents to deploy."""
+    prompt = f"""You are the MANAGER in a local autonomous Windows incident-response crew.
+
+Your job is to decide which specialist agents should work this incident.
+
+Context:
+{json.dumps(context, indent=2)}
+
+Return ONLY JSON with keys:
+- urgency: urgent or normal
+- specialists: list of roles to run from [process, resources, disk, forensics, reporter]
+- focus: one short string describing the main pressure (cpu, memory, disk, processes, logs, general)
+- rationale: one sentence
+- followup_hours: integer (2 if non-urgent)
+
+Rules:
+- Always include process and reporter.
+- Include resources when memory or CPU looks bad.
+- Include disk when disk usage is suspicious.
+- Include forensics when logs or process count look suspicious.
+"""
+    response = _call_ollama(prompt)
+    plan = _extract_json_object(response, _default_crew_plan(context))
+    plan.setdefault("specialists", ["process", "resources", "reporter"])
+    plan.setdefault("urgency", "normal")
+    plan.setdefault("focus", "general")
+    plan.setdefault("followup_hours", 2)
+    plan.setdefault("rationale", "Crew manager generated a default incident plan.")
+    return plan, response
+
+
+def _specialist_agent(role: str, context: dict, plan: dict, evidence: dict) -> str:
+    """Run a specialist agent against the collected evidence."""
+    evidence_blob = json.dumps(evidence, indent=2)
+    prompt = f"""You are the {role.upper()} specialist in a local autonomous incident-response crew.
+
+Mission:
+Investigate the incident and summarize only what your specialty can prove.
+
+Incident context:
+{json.dumps(context, indent=2)}
+
+Manager plan:
+{json.dumps(plan, indent=2)}
+
+Evidence:
+{evidence_blob}
+
+Rules:
+- Be concise.
+- Do not invent PIDs.
+- Use only the evidence provided.
+- End with one sentence beginning with RESULT: that states your conclusion.
+"""
+    return _call_ollama(prompt)
+
+
+def _run_multi_agent_crew(context: dict) -> tuple[str, str, list[str]]:
+    """Local CrewAI-style orchestrator using role-separated Ollama agents."""
+    ev = context["primary_event"]
+    cpu = context["cpu_usage"]
+    ram = context["memory_usage"]
+    disk = context["disk_usage"]
+    logs = "\n".join(context.get("recent_logs", [])) or "None"
+
+    tool_trace: list[str] = []
+    plan, manager_raw = _manager_agent(context)
+    tool_trace.append(f"MANAGER_PLAN: {plan.get('urgency', 'normal')} | {plan.get('focus', 'general')}")
+    tool_trace.append(f"MANAGER_RAW: {manager_raw[:220]}")
+
+    evidence: dict[str, str] = {}
+    candidate_pids: list[str] = []
+
+    # Process specialist is always involved.
+    process_out = TOOLS["check_processes"]()
+    evidence["check_processes"] = process_out
+    tool_trace.append("PROCESS_AGENT: check_processes")
+    pid = _extract_pid(process_out)
+    if pid != "unknown":
+        candidate_pids.append(pid)
+        tool_trace.append(f"PID_CANDIDATE: {pid} (check_processes)")
+
+    top_out = TOOLS["inspect_top_process"]()
+    evidence["inspect_top_process"] = top_out
+    tool_trace.append("PROCESS_AGENT: inspect_top_process")
+    pid2 = _extract_pid(top_out)
+    if pid2 != "unknown":
+        candidate_pids.append(pid2)
+        tool_trace.append(f"PID_CANDIDATE: {pid2} (inspect_top_process)")
+
+    if "resources" in plan.get("specialists", []):
+        mem_out = TOOLS["check_memory"]()
+        evidence["check_memory"] = mem_out
+        tool_trace.append("RESOURCE_AGENT: check_memory")
+        disk_out = TOOLS["check_disk"]()
+        evidence["check_disk"] = disk_out
+        tool_trace.append("RESOURCE_AGENT: check_disk")
+        pid3 = _extract_pid(mem_out + "\n" + disk_out)
+        if pid3 != "unknown":
+            candidate_pids.append(pid3)
+            tool_trace.append(f"PID_CANDIDATE: {pid3} (resources)")
+
+    if "disk" in plan.get("specialists", []):
+        disk_out = evidence.get("check_disk") or TOOLS["check_disk"]()
+        evidence["disk_focus"] = disk_out
+        tool_trace.append("DISK_AGENT: check_disk")
+
+    if "forensics" in plan.get("specialists", []):
+        open_files = TOOLS["check_open_files"]()
+        net = TOOLS["check_network"]()
+        evidence["check_open_files"] = open_files
+        evidence["check_network"] = net
+        tool_trace.append("FORENSICS_AGENT: check_open_files")
+        tool_trace.append("FORENSICS_AGENT: check_network")
+        pid4 = _extract_pid(open_files + "\n" + net)
+        if pid4 != "unknown":
+            candidate_pids.append(pid4)
+            tool_trace.append(f"PID_CANDIDATE: {pid4} (forensics)")
+
+    # Specialist analysis pass.
+    process_analysis = _specialist_agent("process", context, plan, {"process": process_out, "top_process": top_out})
+    tool_trace.append(f"PROCESS_ANALYST: {process_analysis[:220]}")
+
+    resources_analysis = ""
+    if "resources" in plan.get("specialists", []):
+        resources_analysis = _specialist_agent(
+            "resources",
+            context,
+            plan,
+            {"memory": evidence.get("check_memory", ""), "disk": evidence.get("check_disk", "")},
+        )
+        tool_trace.append(f"RESOURCE_ANALYST: {resources_analysis[:220]}")
+
+    disk_analysis = ""
+    if "disk" in plan.get("specialists", []):
+        disk_analysis = _specialist_agent("disk", context, plan, {"disk": evidence.get("disk_focus", "")})
+        tool_trace.append(f"DISK_ANALYST: {disk_analysis[:220]}")
+
+    forensics_analysis = ""
+    if "forensics" in plan.get("specialists", []):
+        forensics_analysis = _specialist_agent(
+            "forensics",
+            context,
+            plan,
+            {"open_files": evidence.get("check_open_files", ""), "network": evidence.get("check_network", "")},
+        )
+        tool_trace.append(f"FORENSICS_ANALYST: {forensics_analysis[:220]}")
+
+    diagnosis_seed = "\n\n".join([x for x in [process_analysis, resources_analysis, disk_analysis, forensics_analysis] if x])
+
+    # Verifier: prefer a PID seen in evidence; otherwise fall back to the top tool PID.
+    final_pid = next((p for p in candidate_pids if p not in {"0", "4"}), "N/A")
+    if final_pid == "N/A":
+        final_pid = _fallback_pid_from_tools()
+        tool_trace.append(f"PID_FALLBACK: {final_pid} (from check_processes)")
+    else:
+        tool_trace.append(f"PID_VERIFIED: {final_pid}")
+
+    verifier_prompt = f"""You are the VERIFIER in a local autonomous Windows crew.
+
+Context:
+{json.dumps(context, indent=2)}
+
+Manager plan:
+{json.dumps(plan, indent=2)}
+
+Candidate PID: {final_pid}
+
+Evidence summary:
+{diagnosis_seed}
+
+Confirm whether the candidate PID is consistent with the evidence. If not, say what is inconsistent.
+Return a short sentence starting with VERIFIED:.
+"""
+    verifier_out = _call_ollama(verifier_prompt)
+    tool_trace.append(f"VERIFIER: {verifier_out[:220]}")
+
+    diagnosis_prompt = f"""You are the REPORTER in a local autonomous Windows crew.
+
+Write a technical diagnosis from the evidence below.
+
+Context:
+Alert={ev}
+CPU={cpu}%
+RAM={ram}%
+Disk={disk}%
+Logs={logs}
+
+Manager plan:
+{json.dumps(plan, indent=2)}
+
+Evidence summary:
+{diagnosis_seed}
+
+Verifier output:
+{verifier_out}
+
+Final PID: {final_pid}
+
+Return exactly one DIAGNOSIS line plus 2-4 short supporting bullets.
+"""
+    diagnosis = _call_ollama(diagnosis_prompt)
+    tool_trace.append(f"REPORTER: {diagnosis[:220]}")
+
+    if not str(final_pid).isdigit():
+        final_pid = _fallback_pid_from_tools()
+        tool_trace.append(f"PID_FALLBACK: {final_pid} (from check_processes)")
+
+    return diagnosis, final_pid, tool_trace
+
+
 # ── agentic reasoning loop ────────────────────────────────────
 def _run_agentic_loop(context: dict) -> tuple:
     """
@@ -340,30 +943,11 @@ Investigate briefly. Start with check_processes.""")
 # ── RCA writer ────────────────────────────────────────────────
 def _write_rca(diagnosis: str, pid: str) -> str:
     """Turns the technical diagnosis into plain English for normal users."""
-    prompt = f"""Write a short report for someone who is NOT a tech expert.
-
-What the investigation found:
-{diagnosis}
-
-The problem process ID (PID) is: {pid}
-
-Write EXACTLY 3 sentences:
-1. What the person would have noticed (computer running slow, freezing, etc.)
-2. Which app caused the problem — include its name and PID number
-3. What they should do right now — one simple action
-
-Keep it under 80 words. Use plain English. No technical jargon.
-Example style: "Your computer was slowing down because Chrome (PID 4521) was using too much memory. Close Chrome and reopen it to fix the problem." """
-
-    try:
-        return _call_ollama(prompt)
-    except Exception:
-        # Never block incident reporting on a second LLM call.
-        return (
-            f"Your system showed an issue that was investigated using live diagnostics. "
-            f"The likely process involved is PID {pid}. "
-            f"Please stop PID {pid} and monitor whether CPU, memory, and disk usage return to normal."
-        )
+    return (
+        f"Your computer was slowed down by the process behind PID {pid}. "
+        f"The crew traced that process during live monitoring, and the diagnosis is: {diagnosis}. "
+        "Stop that process now and check whether CPU, memory, and disk return to normal."
+    )
 
 
 # ── PID extractor ─────────────────────────────────────────────
@@ -374,10 +958,10 @@ def _extract_pid(text: str) -> str:
         p = m.group(1)
         if p not in ("0", "4"):
             return p
-    # Any 3-6 digit standalone number
-    for m in re.finditer(r"\b(\d{3,6})\b", text):
+    # Explicit process-style rows such as "PID 1234" / "pid:1234" / "process 1234"
+    for m in re.finditer(r"\b(?:process|proc|pid)\b\D{0,8}(\d{2,7})\b", text, re.IGNORECASE):
         p = m.group(1)
-        if p not in ("0", "4", "100"):
+        if p not in ("0", "4"):
             return p
     return "unknown"
 
@@ -400,16 +984,10 @@ def run_diagnostic_crew(context: dict) -> dict:
     Called by gui_app.py when an incident is detected.
     Returns: { diagnostic_result, rca, pid, tool_trace, context }
     """
-    diagnosis, pid, tool_trace = _run_agentic_loop(context)
-    if not str(pid).isdigit():
-        pid = _fallback_pid_from_tools()
-        tool_trace.append(f"PID_FALLBACK: {pid} (from check_processes)")
-    rca            = _write_rca(diagnosis, pid)
+    mode = os.getenv("SYSADMIN_DIAGNOSTIC_MODE", "crewai").strip().lower()
+    if mode in {"lightweight", "lite", "agentic-loop", "legacy"}:
+        return _run_diagnostic_lightweight(context)
 
-    return {
-        "diagnostic_result": diagnosis,
-        "rca":               rca,
-        "pid":               pid,
-        "tool_trace":        tool_trace,
-        "context":           context,
-    }
+    if Crew is None:
+        return _run_crewai_via_python312(context)
+    return _run_diagnostic_crew_native(context)

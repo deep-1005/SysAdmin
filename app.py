@@ -20,8 +20,11 @@ from __future__ import annotations
 import asyncio, os, sys, signal, time, threading
 from collections import deque
 from datetime import datetime
-from dotenv import load_dotenv
-load_dotenv()
+import re
+from typing import Any
+from env_loader import ensure_env_loaded
+
+ensure_env_loaded()
 
 import psutil
 from textual.app       import App, ComposeResult
@@ -36,6 +39,9 @@ from rich.panel        import Panel
 from watcher         import Watcher
 from context_builder import ContextBuilder
 from tool_runner     import ToolRunner
+from detective_agent import run_diagnostic_crew
+from notifier        import SlackNotifier
+from process_killer  import describe_process, terminate_process_tree
 try:
     from tray import TrayController
 except Exception:
@@ -276,7 +282,7 @@ class SysAdminApp(App):
     StatusStrip     { background: #111318; color: #8b8fa8; height: 1; dock: bottom; }
     """
 
-    def __init__(self, tray: TrayController):
+    def __init__(self, tray: Any):
         super().__init__()
         self.tray            = tray
         self.watcher         = Watcher()
@@ -286,6 +292,8 @@ class SysAdminApp(App):
         self._last_trigger: dict = {}
         self._cur_pid: str   = None
         self._incident       = False
+        self._last_rca_text: str = ""
+        self._last_incident_ctx: dict[str, Any] = {}
 
     # ── layout ────────────────────────────────────────────────
     def compose(self) -> ComposeResult:
@@ -390,53 +398,34 @@ class SysAdminApp(App):
 
     @work(exclusive=True)
     async def _run_agent(self, ctx: dict):
-        """
-        Async agent loop — chains REAL tool calls with delays so the
-        thought panel streams live. Swap the tool calls for
-        run_diagnostic_crew(ctx) from detective_agent.py once your
-        LLM API keys are set.
-        """
+        """Run the local multi-agent crew and stream its trace to the UI."""
         t = self.query_one("#thoughts", ThoughtPanel)
         t.set_state("detective")
 
-        async def step(icon, text, delay=0.9):
+        async def step(icon, text, delay=0.7):
             await asyncio.sleep(delay)
             self._think(icon, text)
 
-        await step("▸", f"Trigger [{ctx['primary_event']}] — starting diagnostic chain")
-        await step("▸", "Running check_processes()…")
+        await step("▸", f"Trigger [{ctx['primary_event']}] — launching autonomous crew")
+        await step("▸", "Manager agent is assigning specialist tasks…")
 
-        out = self.runner.check_processes()
-        pid = None
-        for line in out.splitlines():
-            if "PID=" in line:
-                raw = line.strip()
-                self._think("→", raw[:60])
-                pid = raw.split("PID=")[1].split()[0]
-                break
+        result = await asyncio.to_thread(run_diagnostic_crew, ctx)
+        tool_trace = result.get("tool_trace", [])
+        pid = result.get("pid", "N/A")
+        rca = result.get("rca", self._build_rca(ctx))
+
+        for item in tool_trace:
+            self._think("→", item)
+            await asyncio.sleep(0.08)
+
         self._cur_pid = pid
+        self._last_rca_text = rca
+        self._last_incident_ctx = result.get("context", ctx) or ctx
         sb = self.query_one("#status", StatusStrip)
         sb._pid = pid or "?"; sb.refresh()
 
-        await step("▸", "Running inspect_top_process()…", 1.1)
-        for ln in self.runner.inspect_top_process().splitlines()[1:4]:
-            await asyncio.sleep(0.3); self._think("→", ln.strip())
-
-        await step("▸", "Running check_memory()…", 1.0)
-        for ln in self.runner.check_memory().splitlines()[1:3]:
-            await asyncio.sleep(0.2); self._think("→", ln.strip())
-
-        await step("▸", "Running check_open_files()…", 0.9)
-        for ln in self.runner.check_open_files().splitlines()[1:3]:
-            await asyncio.sleep(0.2); self._think("→", ln.strip())
-
-        await step("✓", "Root cause identified. Passing to Reporter…", 1.2)
+        await step("✓", "Crew reached consensus. Reporter is writing the RCA…", 0.8)
         t.set_state("reporter")
-        await asyncio.sleep(0.8)
-        self._think("📝", "Compiling Root Cause Analysis…")
-        await asyncio.sleep(1.4)
-
-        rca = self._build_rca(ctx)
         self._think("✓", "RCA complete. Awaiting operator action.")
         t.set_state("done")
 
@@ -468,6 +457,22 @@ class SysAdminApp(App):
             f"[bold]Action:[/bold] terminate PID {pid} and monitor for recovery."
         )
 
+    def _fallback_live_pid(self, blocked: set[int]) -> int | None:
+        """Pick the next valid PID from live top-process output, excluding blocked/system PIDs."""
+        try:
+            out = self.runner.check_processes()
+        except Exception:
+            return None
+
+        for match in re.finditer(r"PID[=:\s]+(\d+)", out, re.IGNORECASE):
+            try:
+                pid = int(match.group(1))
+            except Exception:
+                continue
+            if pid not in blocked:
+                return pid
+        return None
+
     # ── key actions ───────────────────────────────────────────
     def action_demo(self) -> None:
         if self._incident:
@@ -486,42 +491,57 @@ class SysAdminApp(App):
         if self._cur_pid:
             pid = int(self._cur_pid)
             if pid in (0, 4):
-                self._log("ERR", f"Refusing to terminate protected system PID {pid}.")
-                return
+                alt = self._fallback_live_pid({0, 4, os.getpid()})
+                if alt is None:
+                    self._log("ERR", f"Refusing to terminate protected system PID {pid}.")
+                    return
+                self._log("WARN", f"Selected PID {pid} is protected. Switching to live culprit PID {alt}.")
+                pid = alt
             if pid == os.getpid():
-                self._log("ERR", "Refusing to terminate the SysAdmin process itself.")
-                return
+                alt = self._fallback_live_pid({0, 4, os.getpid()})
+                if alt is None:
+                    self._log("ERR", "Refusing to terminate the SysAdmin process itself.")
+                    return
+                self._log("WARN", f"PID {pid} is the SysAdmin app. Switching to live culprit PID {alt}.")
+                pid = alt
 
-            try:
-                proc = psutil.Process(pid)
-                name = proc.name() or "unknown"
-                exe = proc.exe() or "(unavailable)"
-                cmd = " ".join(proc.cmdline()) if proc.cmdline() else "(unavailable)"
-            except Exception:
-                name = "unknown"
-                exe = "(unavailable)"
-                cmd = "(unavailable)"
+            proc_info = describe_process(pid)
+            name = proc_info.get("name", "unknown")
+            exe = proc_info.get("exe", "(unavailable)")
+            cmd = proc_info.get("cmd", "(unavailable)")
 
             self._log("OK", f"Target process: {name} (PID {pid})")
             self._log("INFO", f"EXE: {exe}")
             self._log("INFO", f"CMD: {cmd[:180]}")
-            self._log("OK", f"Sending SIGTERM to {name} (PID {pid})…")
-            try:
-                import signal as _sig
-                os.kill(pid, _sig.SIGTERM)
+            self._log("OK", f"Sending terminate request to {name} (PID {pid})…")
+
+            result = terminate_process_tree(pid)
+
+            if result.get("terminated"):
                 self._log("OK", f"{name} (PID {pid}) terminated.")
-            except Exception as e:
-                self._log("INFO", f"Kill simulation (PID {self._cur_pid}): {e}")
-            self._cur_pid = None
-            self._incident = False
+                self._cur_pid = None
+                self._incident = False
+            else:
+                self._log("ERR", f"Process {name} (PID {pid}) is still running. {result.get('error', '')}")
         else:
             self._log("INFO", "No active PID.")
 
     def action_slack(self) -> None:
-        if os.getenv("SLACK_WEBHOOK_URL"):
-            self._log("OK", "RCA posted to #sysadmin-alerts.")
-        else:
+        if not self._last_rca_text:
+            self._log("INFO", "No RCA is available yet. Trigger an incident first, then press S.")
+            return
+
+        try:
+            notifier = SlackNotifier()
+        except Exception:
             self._log("INFO", "Set SLACK_WEBHOOK_URL to enable Slack alerts.")
+            return
+
+        try:
+            notifier.send_rca(self._last_rca_text, self._last_incident_ctx or {"primary_event": "UNKNOWN"})
+            self._log("OK", "RCA posted to #sysadmin-alerts.")
+        except Exception as e:
+            self._log("ERR", f"Slack send failed: {e}")
 
     def action_minimise(self) -> None:
         """Minimise TUI and keep running as tray-only daemon."""
@@ -533,6 +553,8 @@ class SysAdminApp(App):
     def action_reset(self) -> None:
         self._incident  = False
         self._cur_pid   = None
+        self._last_rca_text = ""
+        self._last_incident_ctx = {}
         self.query_one("#thoughts", ThoughtPanel).clear()
         self.query_one("#thoughts", ThoughtPanel).set_state("idle")
         self.query_one("#rca", RCAPanel).hide()

@@ -4,9 +4,10 @@ PyQt6>=6.6.0
 # ── System monitoring ────────────────────────────
 psutil>=5.9.0
 
-# ── AI: Ollama runs locally — no API package needed ──
-# Ollama is called via HTTP to localhost:11434
-# Just install Ollama from ollama.com and run: ollama pull llama3.2
+# ── AI: CrewAI runs on Python 3.12 with local Ollama ──
+crewai>=1.14.1
+# Ollama is still used as the local model server via HTTP to localhost:11434
+# Use Python 3.12 for the CrewAI runtime in this repo
 
 # ── Env / secrets ────────────────────────────────
 python-dotenv>=1.0.0

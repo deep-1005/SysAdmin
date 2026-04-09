@@ -35,7 +35,8 @@ class Watcher:
             "cpu_usage": round(cpu_usage, 2),
             "memory_usage": round(memory_usage, 2),
             "disk_usage": round(disk_usage, 2),
-            "process_count": process_count
+            "process_count": process_count,
+            "process_count_threshold": self.process_count_threshold,
         }
 
     def detect_events(self, metrics):

@@ -12,7 +12,7 @@ via a tray icon notification + Slack message.
 
 ```bat
 :: 1. Install deps
-pip install -r requirements.txt
+py -3.12 -m pip install -r requirements.txt
 
 :: 2. Configure .env
 :: Make sure these values exist:
@@ -26,13 +26,14 @@ pip install -r requirements.txt
 ollama pull qwen2.5:0.5b
 
 :: 4. Launch full dashboard
-python app.py
+py -3.12 app.py
 
 :: 5. OR start as background tray daemon (minimised)
-python app.py --tray
+py -3.12 app.py --tray
 ```
 
-The app now attempts to auto-start Ollama if it is installed but not running.
+The app now uses CrewAI for the incident crew and still talks to a local Ollama model as the LLM backend.
+Use Python 3.12 for the CrewAI runtime.
 
 ---
 
@@ -128,7 +129,7 @@ sysadmin/
 | **pystray** | Windows system tray icon | Taskbar icon with right-click menu + Windows toast notifications |
 | **Pillow** | Image creation | pystray needs it to draw the coloured tray icon |
 | **psutil** | System metrics | CPU, RAM, Disk, Network, Process list — fully cross-platform |
-| **CrewAI** | Multi-agent orchestration | Detective + Reporter roles, tool access, sequential reasoning |
+| **CrewAI** | Multi-agent orchestration | Detective, verifier, and reporter roles, sequential reasoning |
 | **LangSmith** | Agent trace viewer | See exactly which tool was called and why at smith.langchain.com |
 | **python-dotenv** | Secrets loader | Reads .env file so keys aren't hardcoded |
 
