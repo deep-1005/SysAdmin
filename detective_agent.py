@@ -19,19 +19,32 @@ import urllib.request
 import urllib.error
 import json
 import shutil
+import uuid
 from urllib.parse import urlparse
 from typing import Any
 
 from env_loader import ensure_env_loaded
 from pydantic import BaseModel, Field
 from tool_runner import ToolRunner
+from incident_memory import get_incident_memory
+from structured_logger import log_incident_event
+from jira_integration import create_jira_ticket_if_enabled
+from metrics_exporter import observe_incident
 
-try:
+if sys.version_info >= (3, 14):
+    # CrewAI currently depends on Pydantic v1 internals that are not compatible with Python 3.14+.
+    # Skip native import here so we do not emit runtime warnings; the Python 3.12 bridge path will be used.
+    CrewAgent = Crew = LLM = Process = Task = None
+    _CREWAI_IMPORT_ERROR = RuntimeError(
+        f"CrewAI native runtime is disabled on Python {sys.version_info.major}.{sys.version_info.minor}; use Python 3.12 bridge."
+    )
+else:
+    try:
         from crewai import Agent as CrewAgent, Crew, LLM, Process, Task
-except Exception as crewai_import_error:  # pragma: no cover - environment dependent
+    except Exception as crewai_import_error:  # pragma: no cover - environment dependent
         CrewAgent = Crew = LLM = Process = Task = None
         _CREWAI_IMPORT_ERROR = crewai_import_error
-else:
+    else:
         _CREWAI_IMPORT_ERROR = None
 
 _PY312_BRIDGE_CODE = (
@@ -52,6 +65,8 @@ OLLAMA_EXE = os.getenv("OLLAMA_EXE", "").strip()
 OLLAMA_TIMEOUT_S = int(os.getenv("OLLAMA_TIMEOUT_S", "240"))
 OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "160"))
 OLLAMA_REASONING_TURNS = max(2, int(os.getenv("OLLAMA_REASONING_TURNS", "3")))
+TRIAGE_MODEL = os.getenv("OLLAMA_TRIAGE_MODEL", OLLAMA_MODEL)
+DEEP_RCA_MODEL = os.getenv("OLLAMA_DEEP_RCA_MODEL", OLLAMA_MODEL)
 
 
 def _resolve_ollama_exe() -> str:
@@ -147,7 +162,7 @@ def _post_ollama(model: str, prompt: str) -> str:
 
 
 # ── core LLM call ─────────────────────────────────────────────
-def _call_ollama(prompt: str) -> str:
+def _call_ollama(prompt: str, model: str | None = None) -> str:
     """
     Sends a prompt to the local Ollama server and returns the response.
     Ollama runs on port 11434 by default.
@@ -155,10 +170,11 @@ def _call_ollama(prompt: str) -> str:
     _start_ollama_if_needed()
 
     try:
-        return _post_ollama(OLLAMA_MODEL, prompt)
+        active_model = model or OLLAMA_MODEL
+        return _post_ollama(active_model, prompt)
 
     except (TimeoutError, socket.timeout) as e:
-        if OLLAMA_FALLBACK_MODEL and OLLAMA_FALLBACK_MODEL != OLLAMA_MODEL:
+        if OLLAMA_FALLBACK_MODEL and OLLAMA_FALLBACK_MODEL != (model or OLLAMA_MODEL):
             try:
                 return _post_ollama(OLLAMA_FALLBACK_MODEL, prompt)
             except Exception:
@@ -190,7 +206,7 @@ def _call_ollama(prompt: str) -> str:
             or "runner process has terminated" in err_text
         )
 
-        if low_memory and OLLAMA_FALLBACK_MODEL and OLLAMA_FALLBACK_MODEL != OLLAMA_MODEL:
+        if low_memory and OLLAMA_FALLBACK_MODEL and OLLAMA_FALLBACK_MODEL != (model or OLLAMA_MODEL):
             try:
                 return _post_ollama(OLLAMA_FALLBACK_MODEL, prompt)
             except Exception:
@@ -291,7 +307,8 @@ class IncidentVerdict(BaseModel):
 
 
 def _create_crewai_llm() -> LLM:
-    model_name = OLLAMA_MODEL if OLLAMA_MODEL.startswith("ollama/") else f"ollama/{OLLAMA_MODEL}"
+    model_choice = DEEP_RCA_MODEL or OLLAMA_MODEL
+    model_name = model_choice if model_choice.startswith("ollama/") else f"ollama/{model_choice}"
     return LLM(
         model=model_name,
         base_url=_ollama_base_url(),
@@ -583,33 +600,132 @@ def _run_crewai_via_python312(context: dict) -> dict:
 def _run_diagnostic_crew_native(context: dict) -> dict:
     """Native path that requires CrewAI import to be available in this interpreter."""
     diagnosis, pid, tool_trace = _run_crewai_crew(context)
+    return _finalize_result(context, diagnosis, pid, tool_trace, pipeline_mode="crewai")
+
+
+def _triage_incident(context: dict) -> dict:
+    """Fast triage stage: decide whether deep RCA is required."""
+    fallback = {
+        "severity": context.get("risk_level", "caution"),
+        "deep_rca_required": context.get("risk_level", "safe") != "safe",
+        "reason": "Rule-based fallback triage",
+    }
+
+    prompt = f"""You are a FAST TRIAGE model for incident routing.
+
+Context:
+{json.dumps(context, indent=2)}
+
+Return JSON only with keys:
+- severity: safe | caution | dangerous
+- deep_rca_required: true or false
+- reason: short sentence
+
+Rules:
+- deep_rca_required must be true for dangerous.
+- deep_rca_required should be false for safe unless logs show hard failure.
+"""
+    try:
+        raw = _call_ollama(prompt, model=TRIAGE_MODEL)
+        triage = _extract_json_object(raw, fallback)
+        triage.setdefault("severity", fallback["severity"])
+        triage.setdefault("deep_rca_required", fallback["deep_rca_required"])
+        triage.setdefault("reason", fallback["reason"])
+        return triage
+    except Exception:
+        return fallback
+
+
+def _enrich_context(context: dict) -> tuple[dict, list[dict], str]:
+    enriched = dict(context or {})
+    correlation_id = str(enriched.get("correlation_id") or uuid.uuid4())
+    enriched["correlation_id"] = correlation_id
+    enriched["incident_id"] = str(enriched.get("incident_id") or correlation_id)
+
+    store = get_incident_memory()
+    similar = store.find_similar_incidents(enriched, limit=3)
+    enriched["similar_incidents"] = similar
+    suggestion = store.build_previous_fix_suggestion(similar)
+    if suggestion:
+        enriched["previously_fixed_by"] = suggestion
+
+    return enriched, similar, suggestion
+
+
+def _finalize_result(context: dict, diagnosis: str, pid: str, tool_trace: list[str], pipeline_mode: str) -> dict:
     if not str(pid).isdigit():
         pid = _fallback_pid_from_tools()
         tool_trace.append(f"PID_FALLBACK: {pid} (from check_processes)")
+
+    risk = str(context.get("risk_level") or "caution")
+    triage = context.get("triage", {}) or {}
+    if triage:
+        tool_trace.append(
+            f"TRIAGE: severity={triage.get('severity', risk)} deep_rca_required={triage.get('deep_rca_required', True)} reason={triage.get('reason', '')}"
+        )
+
+    suggestion = context.get("previously_fixed_by", "")
     rca = _write_rca(diagnosis, pid)
-    return {
+    if suggestion:
+        rca = f"{rca}\n\n{suggestion}"
+        tool_trace.append(f"HISTORICAL_FIX: {suggestion}")
+
+    result = {
         "diagnostic_result": diagnosis,
         "rca": rca,
         "pid": pid,
         "tool_trace": tool_trace,
         "context": context,
+        "risk_level": triage.get("severity", risk),
+        "incident_id": context.get("incident_id", context.get("correlation_id", "")),
+        "correlation_id": context.get("correlation_id", ""),
+        "previously_fixed_by": suggestion,
+        "pipeline_mode": pipeline_mode,
     }
+
+    observe_incident(context.get("primary_event", "UNKNOWN"), result.get("risk_level", "caution"))
+
+    try:
+        store = get_incident_memory()
+        incident_id = store.record_incident(context, result)
+        result["incident_id"] = incident_id
+        log_incident_event(
+            "INFO",
+            "incident_recorded",
+            result.get("correlation_id", ""),
+            incident_id=incident_id,
+            primary_event=context.get("primary_event", "UNKNOWN"),
+            risk_level=result.get("risk_level", "caution"),
+            pid=pid,
+            pipeline_mode=pipeline_mode,
+        )
+    except Exception as exc:
+        tool_trace.append(f"INCIDENT_MEMORY_WARN: {exc}")
+
+    jira_result = create_jira_ticket_if_enabled(context, result)
+    if jira_result.get("created"):
+        result["jira_ticket"] = jira_result
+        ticket_key = jira_result.get("key", "")
+        if ticket_key:
+            tool_trace.append(f"JIRA_TICKET: {ticket_key}")
+            result["rca"] = f"{result['rca']}\n\nJira ticket: {ticket_key}"
+            log_incident_event(
+                "INFO",
+                "jira_ticket_created",
+                result.get("correlation_id", ""),
+                incident_id=result.get("incident_id", ""),
+                ticket_key=ticket_key,
+            )
+    else:
+        tool_trace.append(f"JIRA_SKIPPED: {jira_result.get('reason', 'not created')}")
+
+    return result
 
 
 def _run_diagnostic_lightweight(context: dict) -> dict:
     """Lightweight mode that skips CrewAI and uses the compact agentic loop."""
     diagnosis, pid, tool_trace = _run_agentic_loop(context)
-    if not str(pid).isdigit():
-        pid = _fallback_pid_from_tools()
-        tool_trace.append(f"PID_FALLBACK: {pid} (from check_processes)")
-    rca = _write_rca(diagnosis, pid)
-    return {
-        "diagnostic_result": diagnosis,
-        "rca": rca,
-        "pid": pid,
-        "tool_trace": tool_trace,
-        "context": context,
-    }
+    return _finalize_result(context, diagnosis, pid, tool_trace, pipeline_mode="lightweight")
 
 
 def _extract_json_object(text: str, fallback: dict) -> dict:
@@ -984,8 +1100,27 @@ def run_diagnostic_crew(context: dict) -> dict:
     Called by gui_app.py when an incident is detected.
     Returns: { diagnostic_result, rca, pid, tool_trace, context }
     """
+    context, similar, suggestion = _enrich_context(context)
+    log_incident_event(
+        "INFO",
+        "incident_detected",
+        context.get("correlation_id", ""),
+        primary_event=context.get("primary_event", "UNKNOWN"),
+        risk_level=context.get("risk_level", "caution"),
+        similar_found=len(similar),
+    )
+
     mode = os.getenv("SYSADMIN_DIAGNOSTIC_MODE", "crewai").strip().lower()
     if mode in {"lightweight", "lite", "agentic-loop", "legacy"}:
+        return _run_diagnostic_lightweight(context)
+
+    triage = _triage_incident(context)
+    context["triage"] = triage
+    if suggestion:
+        context.setdefault("steps_taken", []).append(suggestion)
+
+    deep_required = bool(triage.get("deep_rca_required", True))
+    if not deep_required:
         return _run_diagnostic_lightweight(context)
 
     if Crew is None:

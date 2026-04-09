@@ -166,7 +166,30 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
 LANGCHAIN_TRACING_V2=true
 LANGCHAIN_API_KEY=ls__...
 LANGCHAIN_PROJECT=sysadmin-ai
+
+# ── Prometheus exporter (optional) ─────
+PROMETHEUS_ENABLED=1
+PROMETHEUS_PORT=9108
+
+# ── Jira integration (optional, dangerous incidents only) ──
+JIRA_ENABLED=0
+JIRA_BASE_URL=https://your-domain.atlassian.net
+JIRA_EMAIL=you@company.com
+JIRA_API_TOKEN=your_jira_api_token
+JIRA_PROJECT_KEY=OPS
+JIRA_ISSUE_TYPE=Task
 ```
+
+---
+
+## Prometheus + Grafana
+
+- Exporter endpoint: `http://localhost:9108/metrics`
+- Grafana dashboard JSONs:
+    - `grafana/dashboards/sysadmin-overview.json`
+    - `grafana/dashboards/sysadmin-incidents.json`
+
+Import those JSON files in Grafana and map the `${DS_PROMETHEUS}` datasource variable to your Prometheus datasource.
 
 ---
 

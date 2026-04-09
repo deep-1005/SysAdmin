@@ -13,8 +13,11 @@ import sys, os, time, threading
 import traceback
 from datetime import datetime
 from collections import deque
-from env_loader import ensure_env_loaded
-from process_killer import terminate_process_tree
+from env_loader import ensure_env_loaded, validate_runtime_environment
+from process_killer import terminate_process_tree, resolve_termination_target
+from incident_memory import get_incident_memory
+from structured_logger import audit_action, log_incident_event
+from metrics_exporter import start_metrics_server, update_system_metrics, observe_action
 
 ensure_env_loaded()
 
@@ -550,7 +553,7 @@ class SplashIntro(QWidget):
         subtitle = QLabel("Sense the glitch. Name the culprit. Solve the mystery.")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setWordWrap(True)
-        subtitle.setFont(QFont("Century Gothic", 15))
+        subtitle.setFont(QFont("Century Gothic", 24, QFont.Weight.DemiBold))
         subtitle.setStyleSheet(f"color: #98dfff; background: transparent;")
 
         hint = QLabel("Click anywhere to open")
@@ -1493,9 +1496,60 @@ class WatcherWorker(QThread):
         self._last_trig: dict = {}
         self._incident   = False
         self._cur_pid    = None
+        self._last_incident_id = ""
+        self._last_correlation_id = ""
+        self._agent_thread: threading.Thread | None = None
+        self._last_proc_refresh_ts = 0.0
+        self._last_proc_rows: list[dict] = []
         self._proc_cpu_primed = False
         self.COOLDOWN    = 90
-        self.DIAGNOSTIC_TIMEOUT_S = max(45, int(os.getenv("DIAGNOSTIC_TIMEOUT_S", "120")))
+        self.DIAGNOSTIC_TIMEOUT_S = max(60, int(os.getenv("DIAGNOSTIC_TIMEOUT_S", "240")))
+
+    def _collect_process_rows(self, max_rows: int = 8) -> list[dict]:
+        """Collect top process rows with a strict time budget so UI never stalls."""
+        skip_pids = {0, 4}
+        skip_names = {"system idle process", "system", "registry", "memory compression"}
+        rows: list[dict] = []
+        deadline = time.time() + 0.35
+
+        for p in psutil.process_iter(["pid", "name", "status"]):
+            if time.time() >= deadline:
+                break
+            try:
+                pid = int(p.info.get("pid") or 0)
+                if pid in skip_pids:
+                    continue
+
+                name = (p.info.get("name") or "(unknown)").strip() or "(unknown)"
+                if name.lower() in skip_names:
+                    continue
+
+                try:
+                    cpu = float(p.cpu_percent(interval=None) or 0.0)
+                except Exception:
+                    cpu = 0.0
+
+                try:
+                    mem_pct = float(p.memory_percent() or 0.0)
+                except Exception:
+                    mem_pct = 0.0
+
+                status = p.info.get("status") or "unknown"
+
+                rows.append({
+                    "pid": pid,
+                    "name": name,
+                    "cpu_percent": cpu,
+                    "memory_percent": mem_pct,
+                    "status": status,
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            except Exception:
+                continue
+
+        rows.sort(key=lambda x: x.get("cpu_percent", 0.0), reverse=True)
+        return rows[:max_rows]
 
     def _extract_pid_from_text(self, text: str) -> str:
         import re
@@ -1518,6 +1572,14 @@ class WatcherWorker(QThread):
 
     def stop(self): self._running = False
 
+    def _start_agent_async(self, ctx: dict):
+        """Run incident diagnosis without blocking live metric refresh."""
+        t = self._agent_thread
+        if t is not None and t.is_alive():
+            return
+        self._agent_thread = threading.Thread(target=self._run_agent, args=(ctx,), daemon=True)
+        self._agent_thread.start()
+
     def run(self):
         # Prime process CPU counters once so the first visible sample is meaningful.
         if not self._proc_cpu_primed:
@@ -1530,10 +1592,16 @@ class WatcherWorker(QThread):
             self._proc_cpu_primed = True
 
         while self._running:
+            loop_started = time.time()
             try:
                 m = self.watcher.get_metrics()
                 ev, evs = self.watcher.detect_events(m)
-                self.sig.metrics_ready.emit({**m, "event": ev})
+                now = time.time()
+                if now - self._last_proc_refresh_ts >= 3.0:
+                    self._last_proc_rows = self._collect_process_rows(max_rows=8)
+                    self._last_proc_refresh_ts = now
+
+                self.sig.metrics_ready.emit({**m, "event": ev, "top_processes": self._last_proc_rows})
 
                 if ev != "NORMAL" and not self._incident:
                     last = self._last_trig.get(ev, 0)
@@ -1541,18 +1609,19 @@ class WatcherWorker(QThread):
                         self._incident = True
                         self._last_trig[ev] = time.time()
                         ctx = self.ctx_builder.build_context(m, ev, evs)
-                        self._run_agent(ctx)
+                        self._start_agent_async(ctx)
             except Exception as e:
                 _write_runtime_log("ERR", f"Worker error: {e}\n{traceback.format_exc()}")
                 self.sig.log_line.emit("ERR", f"Worker error: {e}")
-            time.sleep(2)
+            elapsed = time.time() - loop_started
+            time.sleep(max(0.05, 1.0 - elapsed))
 
     def _run_agent(self, ctx: dict):
         ev = ctx["primary_event"]
         self.sig.log_line.emit("ERR",  f"INCIDENT – {ev}")
         self.sig.log_line.emit("WARN", f"CPU={ctx['cpu_usage']}% – RAM={ctx['memory_usage']}%")
         self.sig.agent_state.emit("detective")
-        self.sig.thought.emit("", f"❄️ Trigger [{ev}] – handing off to local CrewAI agent...")
+        self.sig.thought.emit("", f"❄️ Trigger [{ev}] – handing off to local AI agent...")
         self.sig.thought.emit("", "🧬 Detective agent starting diagnostic chain...")
 
         try:
@@ -1562,7 +1631,7 @@ class WatcherWorker(QThread):
             from detective_agent import run_diagnostic_crew
 
             self.sig.thought.emit("", "💡 Local AI is analyzing your system – this may take 15–30 seconds...")
-            self.sig.log_line.emit("INFO", "CrewAI agent running – analyzing live system data...")
+            self.sig.log_line.emit("INFO", "AI agent running – analyzing live system data...")
 
             result = self._run_diagnostic_crew_with_timeout(
                 run_diagnostic_crew,
@@ -1574,6 +1643,9 @@ class WatcherWorker(QThread):
             pid = result.get("pid", "N/A")
             diag = result.get("diagnostic_result", "")
             tool_trace = result.get("tool_trace", [])
+            self._last_incident_id = str(result.get("incident_id", "") or "")
+            self._last_correlation_id = str(result.get("correlation_id", "") or "")
+            risk_level = str(result.get("risk_level", ctx.get("risk_level", "caution")))
 
             if tool_trace:
                 self.sig.thought.emit("", "AI tool execution trace:")
@@ -1582,6 +1654,11 @@ class WatcherWorker(QThread):
                     self.sig.log_line.emit("INFO", step)
             else:
                 self.sig.log_line.emit("WARN", "No AI tool trace returned for this run.")
+
+            prev_fix = result.get("previously_fixed_by", "")
+            if prev_fix:
+                self.sig.log_line.emit("INFO", prev_fix)
+                self.sig.thought.emit("", f"↺ {prev_fix}")
 
             if not str(pid).isdigit():
                 pid = self._fallback_pid()
@@ -1598,29 +1675,43 @@ class WatcherWorker(QThread):
             self._cur_pid = pid
             self.sig.rca_ready.emit(rca, pid)
             self.sig.log_line.emit("OK",   f"AI diagnosis complete – PID {pid} identified")
+            self.sig.log_line.emit("INFO", f"Risk level: {risk_level}")
             self.sig.log_line.emit("INFO", "Use the action buttons below to respond.")
+            log_incident_event(
+                "INFO",
+                "gui_incident_ready",
+                self._last_correlation_id,
+                incident_id=self._last_incident_id,
+                pid=pid,
+                risk=risk_level,
+                diagnosis_preview=str(diag)[:220],
+            )
             self._incident = False
 
         except RuntimeError as e:
-            # Runtime setup/model issue  show friendly message
-            self.sig.agent_state.emit("idle")
-            self.sig.thought.emit("", str(e))
-            self.sig.log_line.emit("ERR", "CrewAI runtime is not ready or the model load failed.")
-            self.sig.log_line.emit("INFO", "Check: Python 3.12 environment, then run ollama serve")
-            _write_runtime_log("ERR", f"RuntimeError in _run_agent: {e}\n{traceback.format_exc()}")
-            self._incident = False
-
-        except TimeoutError:
-            # If the crew stalls, fail fast and keep the dashboard responsive.
+            # Keep operator-facing text calm and action-oriented.
             self.sig.agent_state.emit("reporter")
-            self.sig.thought.emit("", "CrewAI took too long. Falling back to the local rule-based report.")
-            self.sig.log_line.emit("WARN", "CrewAI timed out  using fallback RCA so the dashboard stays responsive.")
+            self.sig.thought.emit("", "Analysis encountered an issue. Preparing a quick local report.")
+            self.sig.log_line.emit("WARN", "Live analysis interrupted; generating quick local report.")
+            _write_runtime_log("ERR", f"RuntimeError in _run_agent: {e}\n{traceback.format_exc()}")
             rca = self._build_rca(ctx)
             pid = self._cur_pid or self._fallback_pid()
             self._cur_pid = pid
             self.sig.rca_ready.emit(rca, pid)
             self.sig.agent_state.emit("done")
-            _write_runtime_log("WARN", "CrewAI timeout in _run_agent; fallback RCA used.")
+            self._incident = False
+
+        except TimeoutError:
+            # If analysis takes too long, return a quick local report and keep UI responsive.
+            self.sig.agent_state.emit("reporter")
+            self.sig.thought.emit("", "Analysis is taking longer than expected. Preparing a quick local report.")
+            self.sig.log_line.emit("WARN", "Live analysis exceeded response budget; using quick local report.")
+            rca = self._build_rca(ctx)
+            pid = self._cur_pid or self._fallback_pid()
+            self._cur_pid = pid
+            self.sig.rca_ready.emit(rca, pid)
+            self.sig.agent_state.emit("done")
+            _write_runtime_log("WARN", "Analysis timeout in _run_agent; quick local RCA used.")
             self._incident = False
 
         except Exception as e:
@@ -1654,7 +1745,7 @@ class WatcherWorker(QThread):
         t.join(timeout_s)
 
         if t.is_alive():
-            raise TimeoutError(f"Diagnostic timed out after {timeout_s}s")
+            raise TimeoutError(f"Analysis timed out after {timeout_s}s")
 
         if error_box.get("error") is not None:
             raise error_box["error"]
@@ -1738,6 +1829,9 @@ class MainWindow(QMainWindow):
         self._latest_metrics = {}
         self._latest_event = "NORMAL"
 
+        metrics_server = start_metrics_server("gui")
+        self._metrics_server = metrics_server
+
         self._build_ui()
         self._setup_tray()
         self._setup_worker()
@@ -1759,6 +1853,10 @@ class MainWindow(QMainWindow):
         self._rectify_reminder_timer.timeout.connect(self._send_rectify_reminder)
 
         self.log.add("INFO", "Autonomous SysAdmin started  watching your system.")
+        if metrics_server.get("started"):
+            self.log.add("INFO", f"Prometheus exporter listening on :{metrics_server.get('port')}")
+        elif metrics_server.get("enabled"):
+            self.log.add("WARN", f"Prometheus exporter not started: {metrics_server.get('reason')}")
         self.log.add("OK",   f"Thresholds: CPU>{self.watcher.cpu_threshold}%  "
                              f"RAM>{self.watcher.memory_threshold}%  "
                              f"Disk>{self.watcher.disk_threshold}%")
@@ -1955,12 +2053,12 @@ class MainWindow(QMainWindow):
         self.card_ram  = MetricCard("Memory (RAM)", CYAN)
         disk_label = f"Disk Space {self._disk_label()}"
         self.card_disk = MetricCard(disk_label, PURPLE)
-        self.card_proc = MetricCard("Running Apps",  YELLOW)
+        self.card_proc = MetricCard("Process Load",  YELLOW)
 
         self.card_cpu.setToolTip("How hard your processor is working.\nAbove 80% = high load.")
         self.card_ram.setToolTip("How much of your RAM is being used.\nAbove 85% = low memory.")
         self.card_disk.setToolTip("How full your main drive (C:) is.\nAbove 95% = nearly full.")
-        self.card_proc.setToolTip("How many programs are running right now.\nAbove 300 = unusually high.")
+        self.card_proc.setToolTip("Process-load percentage vs threshold.\nSubtitle shows actual process count.")
 
         for c in [self.card_cpu, self.card_ram, self.card_disk, self.card_proc]:
             c.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -2580,6 +2678,7 @@ class MainWindow(QMainWindow):
         ev = m.get("event", "NORMAL")
         self._latest_metrics = dict(m or {})
         self._latest_event = ev
+        update_system_metrics(m, ev, str(m.get("risk_level", "safe")))
         if hasattr(self, "thinking_indicator"):
             self.thinking_indicator.set_active(ev != "NORMAL", CYAN if ev == "NORMAL" else YELLOW)
 
@@ -2588,56 +2687,17 @@ class MainWindow(QMainWindow):
         self._last_event = ev
 
         # update cards
-        mem = psutil.virtual_memory()
         self.card_cpu.push(m["cpu_usage"],
                            f"{psutil.cpu_count()} cores")
         self.card_ram.push(m["memory_usage"],
-                           f"{mem.used/1e9:.1f} / {mem.total/1e9:.1f} GB")
-        try:
-            disk = psutil.disk_usage(self.watcher.disk_path)
-        except Exception:
-            disk = psutil.disk_usage("/")
+                           f"{m.get('memory_used_gb', 0.0):.1f} / {m.get('memory_total_gb', 0.0):.1f} GB")
         self.card_disk.push(m["disk_usage"],
-                            f"{disk.used/(1024**3):.1f} / {disk.total/(1024**3):.1f} GiB")
+                            f"{m.get('disk_used_gb', 0.0):.1f} / {m.get('disk_total_gb', 0.0):.1f} GiB")
         pct = min(100, m["process_count"] / self.watcher.process_count_threshold * 100)
-        self.card_proc.push(pct, f"{m['process_count']} processes")
+        self.card_proc.push(pct, f"{m['process_count']} processes (threshold {self.watcher.process_count_threshold})")
 
-        # process table  filter Windows pseudo-processes
-        _skip_pids   = {0, 4}
-        _skip_names  = {"system idle process", "system", "registry", "memory compression"}
-        rows = []
-        try:
-            # Fetch process fields in guarded per-process calls. This avoids UI hangs on
-            # protected system processes that can intermittently raise AccessDenied.
-            for p in psutil.process_iter():
-                try:
-                    pid = p.pid
-                    if pid in _skip_pids:
-                        continue
-
-                    name = p.name() or "(unknown)"
-                    if name.lower() in _skip_names:
-                        continue
-
-                    cpu = p.cpu_percent(interval=None)
-                    try:
-                        mem_pct = p.memory_percent()
-                    except Exception:
-                        mem_pct = 0.0
-
-                    rows.append({
-                        "pid": pid,
-                        "name": name,
-                        "cpu_percent": cpu,
-                        "memory_percent": mem_pct,
-                    })
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    continue
-                except Exception:
-                    continue
-        except Exception as e:
-            _write_runtime_log("WARN", f"Process table refresh failed: {e}")
-        rows.sort(key=lambda x: x["cpu_percent"] or 0, reverse=True)
+        # Process table rows are prepared in the worker thread to keep UI responsive.
+        rows = m.get("top_processes", []) if isinstance(m, dict) else []
         self.proctable.update_procs(rows)
 
         # update tray + status
@@ -2701,17 +2761,19 @@ class MainWindow(QMainWindow):
         self._pid_icon.setStyleSheet(f"color: {ACCENT_RED}; background: transparent;")
         if str(pid).isdigit():
             info = self._describe_pid(int(pid))
-            self._pid_text.setText(f"Incident active  culprit: {info['name']} (PID {pid})")
+            self._pid_text.setText(f"CULPRIT PID: {pid}  |  {info['name']}")
             self._pid_text.setToolTip(f"EXE: {info['exe']}\nCMD: {info['cmd']}")
+            self.log.add("ERR", f"CULPRIT PID CONFIRMED: {pid} ({info['name']})")
         else:
-            self._pid_text.setText(f"Incident active  culprit PID {pid}")
+            self._pid_text.setText(f"CULPRIT PID: {pid}")
+            self.log.add("WARN", f"Culprit PID reported: {pid}")
         self._pid_text.setStyleSheet(f"color: {ACCENT_RED}; background: transparent;")
         if hasattr(self, "actions_incident_badge"):
             self.actions_incident_badge.show()
         self._set_incident_spotlight(
             " Action Needed",
             YELLOW,
-            f"Issue isolated to PID {pid}.",
+            f"Issue isolated to CULPRIT PID {pid}.",
             "Review the report below, then choose Stop the Problem, Notify via Slack, or Dismiss & Reset."
         )
         self.rca.show_rca(rca, pid)
@@ -2941,6 +3003,8 @@ class MainWindow(QMainWindow):
     #  ACTIONS 
     def _simulate(self):
         self._ui_click()
+        audit_action("manual_live_check", "attempted", getattr(self.worker, "_last_correlation_id", ""))
+        observe_action("manual_live_check", "attempted")
         if getattr(self.worker, "_incident", False):
             self.log.add("INFO", "AI is already investigating an incident. Please wait for it to finish.")
             return
@@ -2964,6 +3028,10 @@ class MainWindow(QMainWindow):
 
     def _kill_pid(self):
         self._ui_click()
+        corr_id = getattr(self.worker, "_last_correlation_id", "")
+        incident_id = getattr(self.worker, "_last_incident_id", "")
+        audit_action("kill_pid", "attempted", corr_id, selected_pid=self._cur_pid or "")
+        observe_action("kill_pid", "attempted")
         pid = self._resolve_action_pid()
         if pid is None:
             self.log.add("INFO", "No numeric PID is available yet. Wait for analysis to finish, then try again.")
@@ -2985,6 +3053,11 @@ class MainWindow(QMainWindow):
             self.log.add("WARN", f"PID {pid} is the SysAdmin app. Switching to live culprit PID {alt}.")
             pid = alt
 
+        root_pid = resolve_termination_target(pid, blocked_pids={0, 4, os.getpid()})
+        if root_pid != pid:
+            self.log.add("WARN", f"PID {pid} is part of a worker tree. Switching termination target to root PID {root_pid}.")
+            pid = root_pid
+
         info = self._describe_pid(pid)
         self._cur_pid = str(pid)
         self.log.add("OK", f"Target process: {info['name']} (PID {pid})")
@@ -2996,8 +3069,24 @@ class MainWindow(QMainWindow):
 
         if terminated:
             self.log.add("OK", f"{info['name']} (PID {pid}) successfully terminated.")
+            audit_action("kill_pid", "executed", corr_id, pid=pid, name=info["name"])
+            observe_action("kill_pid", "executed")
+            get_incident_memory().update_incident_outcome(
+                incident_id,
+                action_taken="terminate_process",
+                outcome="resolved",
+                outcome_notes=f"{info['name']} ({pid}) terminated",
+            )
         else:
             self.log.add("ERR", f"Process {info['name']} (PID {pid}) is still running. {result.get('error', '')}")
+            audit_action("kill_pid", "failed", corr_id, pid=pid, error=result.get("error", ""))
+            observe_action("kill_pid", "failed")
+            get_incident_memory().update_incident_outcome(
+                incident_id,
+                action_taken="terminate_process",
+                outcome="failed",
+                outcome_notes=str(result.get("error", "still running")),
+            )
 
         self._cur_pid = None
         self._pending_rectify_active = False
@@ -3013,15 +3102,24 @@ class MainWindow(QMainWindow):
 
     def _send_slack(self):
         self._ui_click()
+        corr_id = getattr(self.worker, "_last_correlation_id", "")
+        audit_action("send_slack", "attempted", corr_id)
+        observe_action("send_slack", "attempted")
         ok, code, message = self._send_slack_payload(self._last_rca or "No RCA available.")
         if ok:
             self.log.add("OK", " RCA posted to Slack #sysadmin-alerts!")
+            audit_action("send_slack", "executed", corr_id)
+            observe_action("send_slack", "executed")
             self.tray.showMessage("Slack", "RCA sent to your channel.",
                                   QSystemTrayIcon.MessageIcon.Information, 3000)
         elif code == "missing-webhook":
             self._show_slack_setup_dialog()
+            audit_action("send_slack", "failed", corr_id, error="missing-webhook")
+            observe_action("send_slack", "failed")
         else:
             self.log.add("ERR", f"Slack send failed: {message}")
+            audit_action("send_slack", "failed", corr_id, error=message)
+            observe_action("send_slack", "failed")
 
     def _send_slack_payload(self, rca_text: str):
         webhook = self._resolve_slack_webhook()
@@ -3168,6 +3266,13 @@ class MainWindow(QMainWindow):
 
     def _reset(self):
         self._ui_click()
+        audit_action(
+            "reset_incident",
+            "executed",
+            getattr(self.worker, "_last_correlation_id", ""),
+            incident_id=getattr(self.worker, "_last_incident_id", ""),
+        )
+        observe_action("reset_incident", "executed")
         self._cur_pid = None
         self._slack_initial_sent = False
         self._slack_followup_sent = False
@@ -3193,6 +3298,8 @@ class MainWindow(QMainWindow):
         self.rca.hide_rca()
         self.tray.setIcon(_make_tray_icon("green"))
         self.worker.reset()
+        self.worker._last_incident_id = ""
+        self.worker._last_correlation_id = ""
         self.log.add("OK", " System reset  Watcher is monitoring again.")
 
     def _quit(self):
@@ -3222,6 +3329,12 @@ if __name__ == "__main__":
         sys.__excepthook__(exc_type, exc_value, exc_tb)
 
     sys.excepthook = _uncaught_excepthook
+
+    env_report = validate_runtime_environment(os.path.dirname(__file__))
+    for warn in env_report.get("warnings", []):
+        _write_runtime_log("WARN", f"Startup validation: {warn}")
+    for err in env_report.get("errors", []):
+        _write_runtime_log("ERR", f"Startup validation: {err}")
 
     app = QApplication(sys.argv)
     app.setApplicationName("" \

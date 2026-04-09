@@ -22,7 +22,7 @@ from collections import deque
 from datetime import datetime
 import re
 from typing import Any
-from env_loader import ensure_env_loaded
+from env_loader import ensure_env_loaded, validate_runtime_environment
 
 ensure_env_loaded()
 
@@ -41,7 +41,10 @@ from context_builder import ContextBuilder
 from tool_runner     import ToolRunner
 from detective_agent import run_diagnostic_crew
 from notifier        import SlackNotifier
-from process_killer  import describe_process, terminate_process_tree
+from process_killer  import describe_process, terminate_process_tree, resolve_termination_target
+from incident_memory import get_incident_memory
+from structured_logger import audit_action, log_incident_event
+from metrics_exporter import start_metrics_server, update_system_metrics, observe_action
 try:
     from tray import TrayController
 except Exception:
@@ -231,6 +234,8 @@ class StatusStrip(Static):
     _event  = reactive("NORMAL")
     _uptime = reactive(0)
     _pid    = reactive("—")
+    _risk   = reactive("safe")
+    _sla    = reactive("—")
 
     def render(self) -> str:
         h,m,s = self._uptime//3600, (self._uptime%3600)//60, self._uptime%60
@@ -239,6 +244,8 @@ class StatusStrip(Static):
             f" [grey58]uptime[/grey58] [bright_white]{h:02d}:{m:02d}:{s:02d}[/bright_white]"
             f"   [grey58]event[/grey58] [{ec}]{self._event}[/{ec}]"
             f"   [grey58]pid[/grey58] [yellow]{self._pid}[/yellow]"
+            f"   [grey58]risk[/grey58] [bright_white]{self._risk}[/bright_white]"
+            f"   [grey58]sla[/grey58] [bright_white]{self._sla}[/bright_white]"
             f"   [grey58][D] live-check  [K] kill  [S] slack  [M] tray  [R] reset  [Q] quit[/grey58]"
         )
 
@@ -294,6 +301,10 @@ class SysAdminApp(App):
         self._incident       = False
         self._last_rca_text: str = ""
         self._last_incident_ctx: dict[str, Any] = {}
+        self._incident_id: str = ""
+        self._correlation_id: str = ""
+        self._risk_level: str = "safe"
+        self._sla_deadline_ts: float = 0.0
 
     # ── layout ────────────────────────────────────────────────
     def compose(self) -> ComposeResult:
@@ -316,6 +327,18 @@ class SysAdminApp(App):
 
     # ── lifecycle ─────────────────────────────────────────────
     def on_mount(self) -> None:
+        env_report = validate_runtime_environment(os.path.dirname(__file__))
+        for warn in env_report.get("warnings", []):
+            self._log("WARN", f"Startup validation: {warn}")
+        for err in env_report.get("errors", []):
+            self._log("ERR", f"Startup validation: {err}")
+
+        metrics_server = start_metrics_server("tui")
+        if metrics_server.get("started"):
+            self._log("INFO", f"Prometheus exporter listening on :{metrics_server.get('port')}")
+        elif metrics_server.get("enabled"):
+            self._log("WARN", f"Prometheus exporter not started: {metrics_server.get('reason')}")
+
         self.set_interval(POLL_INTERVAL, self._poll)
         self.set_interval(1, self._tick)
         self._log("INFO", "SysAdmin AI started — watching Windows system…")
@@ -327,6 +350,7 @@ class SysAdminApp(App):
     def _poll(self) -> None:
         m = self.watcher.get_metrics()
         ev, evs = self.watcher.detect_events(m)
+        update_system_metrics(m, ev, str(m.get("risk_level", "safe")))
 
         self.query_one("#g-cpu",  MetricCard).push(m["cpu_usage"])
         self.query_one("#g-ram",  MetricCard).push(m["memory_usage"])
@@ -376,7 +400,20 @@ class SysAdminApp(App):
     def _tick(self) -> None:
         sb = self.query_one("#status", StatusStrip)
         sb._uptime = int(time.time() - self._t0)
+        if self._sla_deadline_ts > 0:
+            remaining = max(0, int(self._sla_deadline_ts - time.time()))
+            rh, rm, rs = remaining // 3600, (remaining % 3600) // 60, remaining % 60
+            sb._sla = f"{rh:02d}:{rm:02d}:{rs:02d}"
+        else:
+            sb._sla = "—"
         sb.refresh()
+
+    def _sla_minutes_for_risk(self, risk: str) -> int:
+        if risk == "dangerous":
+            return 15
+        if risk == "caution":
+            return 45
+        return 180
 
     # ── helpers ───────────────────────────────────────────────
     def _log(self, level: str, msg: str):
@@ -389,9 +426,12 @@ class SysAdminApp(App):
     def _start_incident(self, ctx: dict):
         self._incident = True
         ev = ctx["primary_event"]
+        self._risk_level = str(ctx.get("risk_level", "caution"))
+        self._sla_deadline_ts = time.time() + (self._sla_minutes_for_risk(self._risk_level) * 60)
         self._last_trigger[ev] = time.time()
         self._log("ERR",  f"🚨 INCIDENT — {ev}")
         self._log("WARN", f"CPU={ctx['cpu_usage']}%  RAM={ctx['memory_usage']}%  Disk={ctx['disk_usage']}%")
+        observe_action("incident_start", "detected")
         t = self.query_one("#thoughts", ThoughtPanel)
         t.clear(); t.set_state("triggered")
         self._run_agent(ctx)
@@ -421,8 +461,27 @@ class SysAdminApp(App):
         self._cur_pid = pid
         self._last_rca_text = rca
         self._last_incident_ctx = result.get("context", ctx) or ctx
+        self._incident_id = str(result.get("incident_id", "") or "")
+        self._correlation_id = str(result.get("correlation_id", "") or "")
+        self._risk_level = str(result.get("risk_level", self._risk_level) or "caution")
         sb = self.query_one("#status", StatusStrip)
         sb._pid = pid or "?"; sb.refresh()
+        sb._risk = self._risk_level
+        sb.refresh()
+
+        prev_fix = result.get("previously_fixed_by", "")
+        if prev_fix:
+            self._think("↺", prev_fix)
+            self._log("INFO", prev_fix)
+
+        log_incident_event(
+            "INFO",
+            "incident_ui_ready",
+            self._correlation_id,
+            incident_id=self._incident_id,
+            pid=pid,
+            risk=self._risk_level,
+        )
 
         await step("✓", "Crew reached consensus. Reporter is writing the RCA…", 0.8)
         t.set_state("reporter")
@@ -475,6 +534,8 @@ class SysAdminApp(App):
 
     # ── key actions ───────────────────────────────────────────
     def action_demo(self) -> None:
+        audit_action("manual_live_check", "attempted", self._correlation_id)
+        observe_action("manual_live_check", "attempted")
         if self._incident:
             self._log("INFO", "AI is already investigating. Please wait before running another live check.")
             return
@@ -488,6 +549,8 @@ class SysAdminApp(App):
         self._start_incident(ctx)
 
     def action_kill_pid(self) -> None:
+        audit_action("kill_pid", "attempted", self._correlation_id, selected_pid=self._cur_pid or "")
+        observe_action("kill_pid", "attempted")
         if self._cur_pid:
             pid = int(self._cur_pid)
             if pid in (0, 4):
@@ -505,6 +568,11 @@ class SysAdminApp(App):
                 self._log("WARN", f"PID {pid} is the SysAdmin app. Switching to live culprit PID {alt}.")
                 pid = alt
 
+            root_pid = resolve_termination_target(pid, blocked_pids={0, 4, os.getpid()})
+            if root_pid != pid:
+                self._log("WARN", f"PID {pid} is part of a worker tree. Switching target to root PID {root_pid}.")
+                pid = root_pid
+
             proc_info = describe_process(pid)
             name = proc_info.get("name", "unknown")
             exe = proc_info.get("exe", "(unavailable)")
@@ -521,12 +589,30 @@ class SysAdminApp(App):
                 self._log("OK", f"{name} (PID {pid}) terminated.")
                 self._cur_pid = None
                 self._incident = False
+                audit_action("kill_pid", "executed", self._correlation_id, pid=pid, name=name)
+                observe_action("kill_pid", "executed")
+                get_incident_memory().update_incident_outcome(
+                    self._incident_id,
+                    action_taken="terminate_process",
+                    outcome="resolved",
+                    outcome_notes=f"{name} ({pid}) terminated",
+                )
             else:
                 self._log("ERR", f"Process {name} (PID {pid}) is still running. {result.get('error', '')}")
+                audit_action("kill_pid", "failed", self._correlation_id, pid=pid, error=result.get("error", ""))
+                observe_action("kill_pid", "failed")
+                get_incident_memory().update_incident_outcome(
+                    self._incident_id,
+                    action_taken="terminate_process",
+                    outcome="failed",
+                    outcome_notes=str(result.get("error", "still running")),
+                )
         else:
             self._log("INFO", "No active PID.")
 
     def action_slack(self) -> None:
+        audit_action("send_slack", "attempted", self._correlation_id, incident_id=self._incident_id)
+        observe_action("send_slack", "attempted")
         if not self._last_rca_text:
             self._log("INFO", "No RCA is available yet. Trigger an incident first, then press S.")
             return
@@ -540,8 +626,12 @@ class SysAdminApp(App):
         try:
             notifier.send_rca(self._last_rca_text, self._last_incident_ctx or {"primary_event": "UNKNOWN"})
             self._log("OK", "RCA posted to #sysadmin-alerts.")
+            audit_action("send_slack", "executed", self._correlation_id)
+            observe_action("send_slack", "executed")
         except Exception as e:
             self._log("ERR", f"Slack send failed: {e}")
+            audit_action("send_slack", "failed", self._correlation_id, error=str(e))
+            observe_action("send_slack", "failed")
 
     def action_minimise(self) -> None:
         """Minimise TUI and keep running as tray-only daemon."""
@@ -551,15 +641,21 @@ class SysAdminApp(App):
         self.suspend()
 
     def action_reset(self) -> None:
+        audit_action("reset_incident", "executed", self._correlation_id, incident_id=self._incident_id)
+        observe_action("reset_incident", "executed")
         self._incident  = False
         self._cur_pid   = None
         self._last_rca_text = ""
         self._last_incident_ctx = {}
+        self._incident_id = ""
+        self._correlation_id = ""
+        self._risk_level = "safe"
+        self._sla_deadline_ts = 0.0
         self.query_one("#thoughts", ThoughtPanel).clear()
         self.query_one("#thoughts", ThoughtPanel).set_state("idle")
         self.query_one("#rca", RCAPanel).hide()
         sb = self.query_one("#status", StatusStrip)
-        sb._event = "NORMAL"; sb._pid = "—"; sb.refresh()
+        sb._event = "NORMAL"; sb._pid = "—"; sb._risk = "safe"; sb._sla = "—"; sb.refresh()
         self.tray.set_status("green")
         self._log("OK", "System reset — Watcher restarted.")
 

@@ -1,3 +1,6 @@
+import subprocess
+
+
 class ContextBuilder:
     def __init__(self, log_file="logs/system.log"):
         self.log_file = log_file
@@ -54,8 +57,39 @@ class ContextBuilder:
             or process_ratio >= self._log_guard_process_ratio
         )
 
+    def _windows_event_enrichment(self):
+        try:
+            cmd = [
+                "wevtutil",
+                "qe",
+                "System",
+                "/c:5",
+                "/f:text",
+                "/rd:true",
+            ]
+            out = subprocess.check_output(cmd, text=True, timeout=2, stderr=subprocess.DEVNULL)
+            return out.strip()[:1200]
+        except Exception:
+            return ""
+
+    def _wmi_enrichment(self):
+        try:
+            cmd = [
+                "wmic",
+                "cpu",
+                "get",
+                "LoadPercentage,Name",
+                "/format:list",
+            ]
+            out = subprocess.check_output(cmd, text=True, timeout=2, stderr=subprocess.DEVNULL)
+            return out.strip()[:800]
+        except Exception:
+            return ""
+
     def build_context(self, metrics, primary_event, detected_events):
         recent_logs = self.read_recent_logs()
+        event_enrichment = self._windows_event_enrichment()
+        wmi_enrichment = self._wmi_enrichment()
 
         if (
             "NORMAL" in detected_events
@@ -71,8 +105,12 @@ class ContextBuilder:
             "disk_usage": metrics["disk_usage"],
             "process_count": metrics["process_count"],
             "process_count_threshold": metrics.get("process_count_threshold", 300),
+            "risk_level": metrics.get("risk_level", "safe"),
+            "anomaly": metrics.get("anomaly", {}),
             "primary_event": primary_event,
             "detected_events": detected_events,
             "recent_logs": recent_logs,
+            "windows_event_log": event_enrichment,
+            "wmi_summary": wmi_enrichment,
             "steps_taken": []
         }

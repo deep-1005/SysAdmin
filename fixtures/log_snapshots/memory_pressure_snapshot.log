@@ -1,0 +1,5 @@
+2026-04-09T11:20:00Z INFO monitor tick cpu=48.8 mem=79.1 disk=89.0
+2026-04-09T11:20:02Z WARN python.exe pid=22280 rss=3.8GB vms=8.4GB
+2026-04-09T11:20:04Z ERR out of memory: killed process 22280 (python)
+2026-04-09T11:20:06Z WARN swap pressure high
+2026-04-09T11:20:08Z WARN process count rising quickly

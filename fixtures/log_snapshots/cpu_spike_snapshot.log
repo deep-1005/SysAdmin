@@ -1,0 +1,5 @@
+2026-04-09T09:15:12Z INFO monitor tick cpu=62.4 mem=71.2 disk=88.0
+2026-04-09T09:15:14Z WARN process explorer.exe pid=8124 cpu=91.3
+2026-04-09T09:15:15Z WARN process chrome.exe pid=14500 cpu=86.8
+2026-04-09T09:15:16Z ERR scheduler lag detected
+2026-04-09T09:15:17Z WARN connection refused from localhost:5000

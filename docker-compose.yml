@@ -6,7 +6,21 @@ services:
       - "11434:11434"
     volumes:
       - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.00"
+          memory: 6g
+        reservations:
+          cpus: "0.50"
+          memory: 2g
 
   sysadmin:
     build:
@@ -17,14 +31,34 @@ services:
       SYSADMIN_NO_TRAY: "1"
       OLLAMA_URL: "http://ollama:11434/api/generate"
       OLLAMA_MODEL: "qwen2.5:0.5b"
+      PROMETHEUS_ENABLED: "1"
+      PROMETHEUS_PORT: "9108"
+      JIRA_ENABLED: "0"
     depends_on:
-      - ollama
+      ollama:
+        condition: service_healthy
+    ports:
+      - "9108:9108"
     volumes:
       - ./logs:/app/logs
     tty: true
     stdin_open: true
     command: ["python", "app.py", "--no-tray"]
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import psutil,watcher,context_builder,detective_agent; print('ok')"]
+      interval: 45s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+    restart: on-failure:5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 1.5g
+        reservations:
+          cpus: "0.25"
+          memory: 512m
 
 volumes:
   ollama-data:
