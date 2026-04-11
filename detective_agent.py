@@ -512,7 +512,12 @@ def _run_crewai_crew(context: dict) -> tuple[str, str, list[str]]:
     final_pid = next((p for p in candidate_pids if p not in {"0", "4"}), "N/A")
     pid_from_text = _extract_pid("\n".join([process_raw, resources_raw, verifier_raw, diagnosis]))
     if pid_from_text != "unknown":
-        final_pid = pid_from_text
+        if pid_from_text in candidate_pids:
+            final_pid = pid_from_text
+            tool_trace.append(f"PID_CONFIRMED: {pid_from_text} (from model text + evidence)")
+        else:
+            # Ignore LLM-only PIDs that were never observed by diagnostic tools.
+            tool_trace.append(f"PID_REJECTED: {pid_from_text} (not found in tool evidence)")
     if not str(final_pid).isdigit():
         final_pid = _fallback_pid_from_tools()
         tool_trace.append(f"PID_FALLBACK: {final_pid} (from check_processes)")

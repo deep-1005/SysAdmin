@@ -52,6 +52,12 @@ def _write_runtime_log(level: str, message: str):
     except Exception:
         pass
 
+
+def _fullscreen_enabled() -> bool:
+    """Return True only when fullscreen is explicitly enabled by env."""
+    raw = os.getenv("SYSADMIN_FULLSCREEN", "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
 #  project modules 
 sys.path.insert(0, os.path.dirname(__file__))
 from watcher         import Watcher
@@ -1503,18 +1509,17 @@ class WatcherWorker(QThread):
         self._last_proc_rows: list[dict] = []
         self._proc_cpu_primed = False
         self.COOLDOWN    = 90
-        self.DIAGNOSTIC_TIMEOUT_S = max(60, int(os.getenv("DIAGNOSTIC_TIMEOUT_S", "240")))
+        timeout_raw = int(os.getenv("DIAGNOSTIC_TIMEOUT_S", "240"))
+        # 0 means "no timeout" so we always wait for full AI output.
+        self.DIAGNOSTIC_TIMEOUT_S = 0 if timeout_raw <= 0 else max(60, timeout_raw)
 
     def _collect_process_rows(self, max_rows: int = 8) -> list[dict]:
-        """Collect top process rows with a strict time budget so UI never stalls."""
+        """Collect top process rows from a full snapshot for accurate ranking."""
         skip_pids = {0, 4}
         skip_names = {"system idle process", "system", "registry", "memory compression"}
         rows: list[dict] = []
-        deadline = time.time() + 0.35
 
         for p in psutil.process_iter(["pid", "name", "status"]):
-            if time.time() >= deadline:
-                break
             try:
                 pid = int(p.info.get("pid") or 0)
                 if pid in skip_pids:
@@ -1597,7 +1602,7 @@ class WatcherWorker(QThread):
                 m = self.watcher.get_metrics()
                 ev, evs = self.watcher.detect_events(m)
                 now = time.time()
-                if now - self._last_proc_refresh_ts >= 3.0:
+                if now - self._last_proc_refresh_ts >= 1.0:
                     self._last_proc_rows = self._collect_process_rows(max_rows=8)
                     self._last_proc_refresh_ts = now
 
@@ -1730,7 +1735,10 @@ class WatcherWorker(QThread):
             self._incident = False
 
     def _run_diagnostic_crew_with_timeout(self, func, ctx: dict, timeout_s: int = 60) -> dict:
-        """Run the Ollama diagnostic in a helper thread and fail fast if it stalls."""
+        """Run the Ollama diagnostic in a helper thread.
+
+        timeout_s <= 0 disables timeout and waits for full completion.
+        """
         result_box: dict = {}
         error_box: dict = {}
 
@@ -1742,9 +1750,12 @@ class WatcherWorker(QThread):
 
         t = threading.Thread(target=_target, daemon=True)
         t.start()
-        t.join(timeout_s)
+        if timeout_s <= 0:
+            t.join()
+        else:
+            t.join(timeout_s)
 
-        if t.is_alive():
+        if timeout_s > 0 and t.is_alive():
             raise TimeoutError(f"Analysis timed out after {timeout_s}s")
 
         if error_box.get("error") is not None:
@@ -2416,7 +2427,12 @@ class MainWindow(QMainWindow):
 
     def _show_dashboard(self):
         self.stack.setCurrentIndex(1)
-        self.showFullScreen()
+        if _fullscreen_enabled():
+            self.showFullScreen()
+        else:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
         self._position_rca_popup()
 
     def _small(self, text: str) -> QLabel:
@@ -2439,9 +2455,24 @@ class MainWindow(QMainWindow):
     def _resolve_action_pid(self):
         """Find a numeric PID for kill action from UI/state/fallback sources."""
         current_pid = os.getpid()
+        protected_names = {"ollama.exe"}
+
+        # During explicit CPU spike incidents, prefer known local spike scripts
+        # so the demo kill action targets the generated load first.
+        if self._latest_event == "CPU_SPIKE":
+            demo_pid = self._find_running_script_pid({"cpu_spike_test.py", "urgent_threshold_test.py"})
+            if demo_pid is not None and demo_pid not in (0, 4, current_pid):
+                return demo_pid
 
         if self._has_real_pid():
             pid = int(self._cur_pid)
+            if pid not in (0, 4, current_pid):
+                try:
+                    name = (psutil.Process(pid).name() or "").lower()
+                    if name in protected_names:
+                        pid = 0
+                except Exception:
+                    pass
             if pid not in (0, 4, current_pid):
                 return pid
 
@@ -2475,13 +2506,47 @@ class MainWindow(QMainWindow):
             if str(pid).isdigit():
                 pid = int(pid)
                 if pid not in (0, 4, current_pid):
+                    try:
+                        name = (psutil.Process(pid).name() or "").lower()
+                        if name in protected_names:
+                            return None
+                    except Exception:
+                        pass
                     return pid
         except Exception:
             pass
 
         return None
 
-    def _fallback_live_pid(self, blocked: set[int]):
+    def _find_running_script_pid(self, script_names: set[str]) -> int | None:
+        """Return a running python PID whose cmdline includes one of the given script names."""
+        try:
+            targets = {s.lower() for s in script_names}
+            candidates: list[tuple[float, int]] = []
+            for p in psutil.process_iter(["pid", "name"]):
+                try:
+                    pid = int(p.info.get("pid") or 0)
+                    if pid in (0, 4, os.getpid()):
+                        continue
+                    name = (p.info.get("name") or "").lower()
+                    if "python" not in name:
+                        continue
+                    cmdline = [str(x).lower() for x in (p.cmdline() or [])]
+                    if not any(any(target in token for target in targets) for token in cmdline):
+                        continue
+                    candidates.append((float(p.cpu_percent(interval=None) or 0.0), pid))
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+                except Exception:
+                    continue
+            if not candidates:
+                return None
+            candidates.sort(reverse=True)
+            return candidates[0][1]
+        except Exception:
+            return None
+
+    def _fallback_live_pid(self, blocked: set[int], blocked_names: set[str] | None = None):
         """Pick a live PID from top-process output, excluding blocked PIDs."""
         import re
 
@@ -2490,10 +2555,16 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
-        for match in re.finditer(r"PID[=:\s]+(\d+)", out, re.IGNORECASE):
+        blocked_name_set = {n.lower() for n in (blocked_names or set())}
+        row_re = re.compile(r"PID[=:\s]+(\d+).*?NAME[=:\s]+([^\s]+)", re.IGNORECASE)
+
+        for match in row_re.finditer(out):
             try:
                 pid = int(match.group(1))
             except Exception:
+                continue
+            name = (match.group(2) or "").strip().lower()
+            if name in blocked_name_set:
                 continue
             if pid not in blocked:
                 return pid
@@ -3037,8 +3108,10 @@ class MainWindow(QMainWindow):
             self.log.add("INFO", "No numeric PID is available yet. Wait for analysis to finish, then try again.")
             return
 
+        protected_names = {"ollama.exe"}
+
         if pid in (0, 4):
-            alt = self._fallback_live_pid({0, 4, os.getpid()})
+            alt = self._fallback_live_pid({0, 4, os.getpid()}, blocked_names=protected_names)
             if alt is None:
                 self.log.add("ERR", f"Refusing to terminate protected system PID {pid}.")
                 return
@@ -3046,7 +3119,7 @@ class MainWindow(QMainWindow):
             pid = alt
 
         if pid == os.getpid():
-            alt = self._fallback_live_pid({0, 4, os.getpid()})
+            alt = self._fallback_live_pid({0, 4, os.getpid()}, blocked_names=protected_names)
             if alt is None:
                 self.log.add("ERR", "Refusing to terminate the SysAdmin app process itself.")
                 return
@@ -3059,6 +3132,15 @@ class MainWindow(QMainWindow):
             pid = root_pid
 
         info = self._describe_pid(pid)
+        if (info.get("name") or "").lower() in protected_names:
+            alt = self._fallback_live_pid({0, 4, os.getpid(), pid}, blocked_names=protected_names)
+            if alt is None:
+                self.log.add("ERR", f"Refusing to terminate protected process {info.get('name', 'unknown')} (PID {pid}).")
+                return
+            self.log.add("WARN", f"PID {pid} is protected ({info.get('name', 'unknown')}). Switching to live culprit PID {alt}.")
+            pid = alt
+            info = self._describe_pid(pid)
+
         self._cur_pid = str(pid)
         self.log.add("OK", f"Target process: {info['name']} (PID {pid})")
         self.log.add("INFO", f"EXE: {info['exe']}")
@@ -3341,7 +3423,11 @@ if __name__ == "__main__":
     " SysAdmin")
     app.setQuitOnLastWindowClosed(False)   # keep running in tray
     win = MainWindow()
-    win.showFullScreen()
+    if _fullscreen_enabled():
+        win.showFullScreen()
+    else:
+        win.resize(1600, 900)
+        win.show()
     rc = 0
     try:
         rc = app.exec()

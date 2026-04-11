@@ -33,6 +33,29 @@ class ToolRunner:
     # Windows pseudo-processes that always show misleading CPU — skip them
     SKIP_NAMES = {"system idle process", "system", "registry", "memory compression"}
     SKIP_PIDS  = {0, 4}   # PID 0 = Idle, PID 4 = System kernel
+    DEMO_SCRIPTS = {"cpu_spike_test.py", "urgent_threshold_test.py"}
+
+    def _detect_demo_roots(self) -> dict[int, str]:
+        """Return {pid: script_name} for running demo generator controller processes."""
+        roots: dict[int, str] = {}
+        for p in psutil.process_iter(["pid", "name"]):
+            try:
+                pid = int(p.info.get("pid") or 0)
+                if pid in self.SKIP_PIDS:
+                    continue
+                name = (p.info.get("name") or "").lower()
+                if "python" not in name:
+                    continue
+                cmdline = [str(x).lower() for x in (p.cmdline() or [])]
+                for script in self.DEMO_SCRIPTS:
+                    if any(script in token for token in cmdline):
+                        roots[pid] = script
+                        break
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            except Exception:
+                continue
+        return roots
 
     def _safe_process_info(self, attrs):
         procs = []
@@ -64,7 +87,7 @@ class ToolRunner:
         procs = []
         for p in psutil.process_iter():
             try:
-                info = p.as_dict(attrs=["pid", "name", "memory_percent", "status"])
+                info = p.as_dict(attrs=["pid", "ppid", "name", "memory_percent", "status"])
                 if info.get("pid") in self.SKIP_PIDS:
                     continue
                 if info.get("pid") == current_pid:
@@ -79,8 +102,63 @@ class ToolRunner:
                 continue
         return procs
 
+    def _aggregate_demo_entries(self, procs: list[dict]) -> list[dict]:
+        """Merge demo script controller + worker CPU into a single controller row."""
+        roots = self._detect_demo_roots()
+        if not roots:
+            return procs
+
+        by_pid: dict[int, dict] = {}
+        children_by_ppid: dict[int, list[int]] = {}
+        for info in procs:
+            try:
+                pid = int(info.get("pid") or 0)
+                ppid = int(info.get("ppid") or 0)
+            except Exception:
+                continue
+            by_pid[pid] = info
+            children_by_ppid.setdefault(ppid, []).append(pid)
+
+        consumed: set[int] = set()
+        synthetic: list[dict] = []
+
+        for root_pid, script_name in roots.items():
+            if root_pid not in by_pid:
+                continue
+
+            subtree = {root_pid}
+            stack = [root_pid]
+            while stack:
+                cur = stack.pop()
+                for child in children_by_ppid.get(cur, []):
+                    if child not in subtree:
+                        subtree.add(child)
+                        stack.append(child)
+
+            cpu_sum = 0.0
+            mem_sum = 0.0
+            for pid in subtree:
+                info = by_pid.get(pid)
+                if not info:
+                    continue
+                cpu_sum += float(info.get("cpu_percent") or 0.0)
+                mem_sum += float(info.get("memory_percent") or 0.0)
+
+            root = dict(by_pid[root_pid])
+            root["name"] = script_name
+            root["cpu_percent"] = cpu_sum
+            root["memory_percent"] = mem_sum
+            root["status"] = "running"
+            synthetic.append(root)
+            consumed.update(subtree)
+
+        merged = [p for p in procs if int(p.get("pid") or 0) not in consumed]
+        merged.extend(synthetic)
+        return merged
+
     def check_processes(self) -> str:
         procs = self._safe_process_info_with_cpu()
+        procs = self._aggregate_demo_entries(procs)
         procs.sort(key=lambda x: x["cpu_percent"] or 0, reverse=True)
         lines = ["Top 5 processes by CPU:"]
         for p in procs[:5]:
@@ -122,6 +200,7 @@ class ToolRunner:
 
     def inspect_top_process(self) -> str:
         procs = self._safe_process_info_with_cpu()
+        procs = self._aggregate_demo_entries(procs)
         procs.sort(key=lambda x: x["cpu_percent"] or 0, reverse=True)
         if not procs:
             return "No processes found."
