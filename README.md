@@ -17,13 +17,22 @@ SysAdmin is a Windows-native system monitoring and incident-response app built i
 <img width="1280" height="799" alt="screenshot1" src="https://github.com/user-attachments/assets/71542005-c94b-4599-afb6-9a4455c3e446" />
 
 <img width="1280" height="673" alt="screenshot2" src="https://github.com/user-attachments/assets/94ace18a-9bab-4122-84d9-a3100947d2df" />
+
 Dashboard with all system monitor.
 
+
+
 <img width="1280" height="680" alt="screenshot3" src="https://github.com/user-attachments/assets/073d1da0-24fd-4e81-88d6-64a82a9ff470" />
+
 Problem with the system discovered by our AI after running a fake CPU spike.
 
+
+
 <img width="1280" height="660" alt="screenshot4" src="https://github.com/user-attachments/assets/6d68cd5f-0828-4b96-ade2-35df3c867bf2" />
+
 The slack alert sent giving a detailed RCA analysis. 
+
+
 
 
 ```
