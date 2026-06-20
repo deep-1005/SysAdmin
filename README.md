@@ -1,210 +1,154 @@
-# ⚡ Autonomous SysAdmin — Windows Native
+# SysAdmin
 
-**Textual TUI + Windows System Tray — no browser, no Electron, pure Python.**
+SysAdmin is a Windows-native system monitoring and incident-response app built in Python. It combines a live terminal dashboard, a native desktop GUI, system tray controls, local AI-assisted incident analysis, and optional observability/integration hooks.
 
-A full-screen terminal dashboard that watches your Windows system,
-fires an AI agent crew when something goes wrong, and pings you
-via a tray icon notification + Slack message.
+## What it does
 
----
+- Watches CPU, memory, disk, and running processes
+- Detects incidents and builds context automatically
+- Runs an AI-assisted diagnostic flow with local Ollama or supported LLM backends
+- Shows alerts in a terminal dashboard or a PyQt6 desktop window
+- Sends notifications through the system tray and optional Slack alerts
+- Exports metrics for Prometheus and Grafana
+- Supports Docker for local demo or containerized runs
+
+## Screenshots
+
+Add your four screenshots to the `screenshots/` folder and use the filenames below in this section.
+
+Suggested layout:
+
+- `screenshots/01-dashboard.png`
+- `screenshots/02-incident.png`
+- `screenshots/03-tray.png`
+- `screenshots/04-rca.png`
+
+Example markup:
+
+```md
+![Dashboard](screenshots/01-dashboard.png)
+![Incident view](screenshots/02-incident.png)
+![Tray menu](screenshots/03-tray.png)
+![Root cause analysis](screenshots/04-rca.png)
+```
+
+## Tech stack
+
+### Core runtime
+
+- Python 3.12
+- psutil for host monitoring
+- python-dotenv for environment loading
+- prometheus-client for metrics export
+
+### User interfaces
+
+- Textual for the full-screen terminal dashboard
+- Rich for terminal rendering
+- PyQt6 for the native desktop GUI
+- pystray for the Windows tray icon and tray actions
+- Pillow for tray icon image generation
+
+### AI and incident workflow
+
+- CrewAI for multi-agent incident analysis
+- Ollama as the local model server
+- Optional LangSmith tracing for agent visibility
+
+### Integrations and ops
+
+- Slack webhooks for notifications
+- Jira integration for ticket creation on serious incidents
+- Prometheus and Grafana for metrics and dashboards
+- Docker and Docker Compose for containerized runs
+
+## Project structure
+
+```text
+SysAdmin/
+├── app.py                # Textual TUI + tray orchestrator
+├── gui_app.py            # Native PyQt6 desktop app
+├── tray.py               # System tray controller
+├── watcher.py            # Incident watcher
+├── context_builder.py    # Builds diagnostic context
+├── detective_agent.py    # CrewAI diagnostic crew
+├── tool_runner.py        # Safe tool execution layer
+├── process_killer.py     # Process termination helpers
+├── notifier.py           # Slack notifier
+├── metrics_exporter.py   # Prometheus metrics endpoint
+├── docker-compose.yml    # Ollama + app services
+├── Dockerfile            # Container image for the app
+├── requirements.txt      # Main Python dependencies
+├── screenshots/          # Add the four README screenshots here
+└── logs/                 # Runtime and incident logs
+```
 
 ## Quick start
 
 ```bat
-:: 1. Install deps
 py -3.12 -m pip install -r requirements.txt
-
-:: 2. Configure .env
-:: Make sure these values exist:
-:: OLLAMA_URL=http://localhost:11434/api/generate
-:: OLLAMA_MODEL=qwen2.5:0.5b
-:: OLLAMA_MODELS=E:\ollama\models
-:: If Ollama is on drive E, also set:
-:: OLLAMA_EXE=E:\Program Files\Ollama\ollama.exe
-
-:: 3. Ensure Ollama model is available
-ollama pull qwen2.5:0.5b
-
-:: 4. Launch full dashboard
-py -3.12 app.py
-
-:: 5. OR start as background tray daemon (minimised)
-py -3.12 app.py --tray
 ```
 
-The app now uses CrewAI for the incident crew and still talks to a local Ollama model as the LLM backend.
-Use Python 3.12 for the CrewAI runtime.
+Create a `.env` file with the values you need. The README assumes a local Ollama setup by default:
 
----
+```env
+OLLAMA_URL=http://localhost:11434/api/generate
+OLLAMA_MODEL=qwen2.5:0.5b
+OLLAMA_MODELS=E:\ollama\models
+# OLLAMA_EXE=E:\Program Files\Ollama\ollama.exe
+```
 
-## Docker setup
+Then run one of the entry points:
 
-This repo now includes Docker support for running the Textual dashboard in a container.
+```bat
+py -3.12 app.py
+py -3.12 gui_app.py
+```
 
-### 1. Build and start Ollama
+## Docker
+
+Start the local Ollama service and app with Docker Compose:
 
 ```bash
 docker compose up -d ollama
-```
-
-### 2. Pull the model inside Ollama container
-
-```bash
 docker exec -it sysadmin-ollama ollama pull qwen2.5:0.5b
-```
-
-### 3. Run SysAdmin app
-
-```bash
 docker compose run --rm sysadmin
 ```
 
-The app runs with `--no-tray` inside Docker (tray icon is disabled in containers).
+The containerized app runs without the tray icon. For full Windows host monitoring and tray integration, run the app natively.
 
-### 4. Stop services
+## Keyboard shortcuts
 
-```bash
-docker compose down
-```
+### Terminal dashboard
 
-### Important limitation (Windows host monitoring)
+- `D` simulate a demo spike
+- `K` kill the identified culprit process
+- `S` send the RCA to Slack
+- `M` minimise to tray
+- `R` reset the incident
+- `Q` quit
 
-Inside Docker, `psutil` reads container-level metrics, not full host Windows metrics.
-For full Windows desktop monitoring + tray integration, run natively with `python app.py` or `python gui_app.py`.
+## Environment variables
 
----
+Common settings used by the app:
 
-## Keyboard shortcuts (inside TUI)
+- `SYSADMIN_LLM`
+- `OPENAI_API_KEY`
+- `ANTHROPIC_API_KEY`
+- `SLACK_WEBHOOK_URL`
+- `LANGCHAIN_TRACING_V2`
+- `LANGCHAIN_API_KEY`
+- `PROMETHEUS_ENABLED`
+- `PROMETHEUS_PORT`
+- `JIRA_ENABLED`
+- `JIRA_BASE_URL`
+- `JIRA_EMAIL`
+- `JIRA_API_TOKEN`
+- `JIRA_PROJECT_KEY`
+- `JIRA_ISSUE_TYPE`
 
-| Key | Action |
-|-----|--------|
-| `D` | **Demo** — simulate a CPU spike right now |
-| `K` | **Kill** the identified culprit PID |
-| `S` | **Slack** — post RCA to your channel |
-| `M` | **Minimise** to system tray (keeps running) |
-| `R` | **Reset** — clear incident, restart watcher |
-| `Q` | **Quit** entirely |
+## Notes
 
----
-
-## System tray (right-click menu)
-
-| Menu item | What it does |
-|-----------|-------------|
-| Open Dashboard | Restores the full Textual TUI |
-| Show Last RCA  | Windows toast notification with the RCA text |
-| Simulate Spike | Triggers a fake CPU_SPIKE for demo |
-| Quit           | Shuts down everything |
-
----
-
-## Project structure
-
-```
-sysadmin/
-├── app.py              ← Textual TUI + tray orchestrator (MAIN ENTRY)
-├── tray.py             ← pystray Windows tray icon + menu
-├── detective_agent.py  ← CrewAI Detective + Reporter agents
-├── tool_runner.py      ← Windows-safe read-only tool sandbox
-├── watcher.py          ← YOUR ORIGINAL — unchanged
-├── context_builder.py  ← YOUR ORIGINAL — unchanged
-├── chaos_monkey.py     ← Demo chaos scripts (CPU / RAM / disk / zombie)
-├── notifier.py         ← Slack webhook sender
-├── requirements.txt
-├── .env                ← API keys (never commit this)
-└── logs/
-    └── system.log
-```
-
----
-
-## Technology stack
-
-### What you're using
-
-| Library | Purpose | Why it matters |
-|---------|---------|----------------|
-| **Textual** | Full-screen TUI framework | Panels, live reactive widgets, keyboard events — runs natively in Windows Terminal |
-| **Rich** | Terminal rendering | Tables, coloured text, sparklines. Textual's rendering engine |
-| **pystray** | Windows system tray icon | Taskbar icon with right-click menu + Windows toast notifications |
-| **Pillow** | Image creation | pystray needs it to draw the coloured tray icon |
-| **psutil** | System metrics | CPU, RAM, Disk, Network, Process list — fully cross-platform |
-| **CrewAI** | Multi-agent orchestration | Detective, verifier, and reporter roles, sequential reasoning |
-| **LangSmith** | Agent trace viewer | See exactly which tool was called and why at smith.langchain.com |
-| **python-dotenv** | Secrets loader | Reads .env file so keys aren't hardcoded |
-
-### Technologies to add next (ranked by impact)
-
-| Library | What it adds | Difficulty |
-|---------|-------------|------------|
-| **textual-plotext** | Live 60-second CPU/RAM line graphs inside panels | Easy — 1 widget swap |
-| **SQLite + peewee** | Case memory — agent checks history before diagnosing | Medium |
-| **win10toast / winotify** | Native Windows 10/11 toast notifications (richer than pystray's) | Easy |
-| **LangGraph** | Replace CrewAI — non-linear agent loops, retry on uncertainty | Medium |
-| **Anthropic Claude** | Swap LLM — better at tool-use constraints than GPT-4o | Easy — 1 env var |
-| **schedule** | Daily summary report emailed/Slacked at 9am | Easy |
-| **pywin32** | Read Windows Event Log directly (instead of system.log file) | Medium |
-| **wmi** | Windows-only deep system info (BIOS, hardware sensors, services) | Medium |
-
----
-
-## .env file
-
-```env
-# ── LLM (pick one) ────────────────────
-OPENAI_API_KEY=sk-...
-SYSADMIN_LLM=gpt-4o
-
-# OR for Claude:
-# ANTHROPIC_API_KEY=sk-ant-...
-# SYSADMIN_LLM=claude-3-5-sonnet-20241022
-
-# ── Slack (optional) ──────────────────
-SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
-
-# ── LangSmith tracing (recommended for demos) ──
-LANGCHAIN_TRACING_V2=true
-LANGCHAIN_API_KEY=ls__...
-LANGCHAIN_PROJECT=sysadmin-ai
-
-# ── Prometheus exporter (optional) ─────
-PROMETHEUS_ENABLED=1
-PROMETHEUS_PORT=9108
-
-# ── Jira integration (optional, dangerous incidents only) ──
-JIRA_ENABLED=0
-JIRA_BASE_URL=https://your-domain.atlassian.net
-JIRA_EMAIL=you@company.com
-JIRA_API_TOKEN=your_jira_api_token
-JIRA_PROJECT_KEY=OPS
-JIRA_ISSUE_TYPE=Task
-```
-
----
-
-## Prometheus + Grafana
-
-- Exporter endpoint: `http://localhost:9108/metrics`
-- Grafana dashboard JSONs:
-    - `grafana/dashboards/sysadmin-overview.json`
-    - `grafana/dashboards/sysadmin-incidents.json`
-
-Import those JSON files in Grafana and map the `${DS_PROMETHEUS}` datasource variable to your Prometheus datasource.
-
----
-
-## Demo script (show-off sequence)
-
-```
-Terminal 1:   python app.py
-              (full dashboard opens)
-
-Terminal 2:   python chaos_monkey.py cpu
-              (CPU burns to ~95%)
-
-Dashboard:    Watch Watcher fire → Detective chain tools live →
-              RCA appears → press K to kill → tray turns green
-```
-
-Or just press **D** inside the dashboard for an instant simulation.
-```
+- Use Python 3.12 for the CrewAI-backed workflow.
+- If Ollama is installed but no model is present, pull a model first with `ollama pull qwen2.5:0.5b`.
+- The codebase includes both a native GUI and a terminal-first experience, so choose the entry point that fits the demo.
